@@ -30,6 +30,7 @@ from tj4tools.roster import (
 )
 
 NEW_BLOCK_PREFIX = "＋新建车间块："
+UNSET = "（未指定）"
 UNDECIDED, APPLY, CANCEL = "待定", "应用", "取消"
 PAGE_SIZE = 20
 
@@ -161,14 +162,24 @@ def guess_roles(result) -> tuple[str | None, str | None]:
 # --------------------------------------------------------------------------- #
 
 
-def strip_new_block(value: str) -> str:
+def to_workshop(value: str) -> str:
+    """把界面上的选项值还原成真正的车间名。"""
+    if not value or value == UNSET:
+        return ""
     return value[len(NEW_BLOCK_PREFIX) :] if value.startswith(NEW_BLOCK_PREFIX) else value
 
 
+def to_option(value: str, options: list[str]) -> str:
+    """把车间名转成下拉里合法的选项值。"""
+    if not value:
+        return UNSET
+    return value if value in options else NEW_BLOCK_PREFIX + value
+
+
 def build_options(bonus, groups) -> list[str]:
-    """下拉选项 = 空 + 原有车间 + 「新建车间块」候选。"""
+    """下拉选项 = 未指定 + 原有车间 + 「新建车间块」候选。"""
     return (
-        [""]
+        [UNSET]
         + list(bonus.workshops)
         + [NEW_BLOCK_PREFIX + name for name in sorted({g for g in groups if g})]
     )
@@ -185,6 +196,14 @@ def effective_workshop(item, mapping) -> str:
     return guess.workshop if guess else ""
 
 
+def describe_guess(guess) -> str:
+    if guess is None or not guess.workshop:
+        return "需人工指定"
+    if guess.source == "经验":
+        return f"{guess.workshop}（两表已匹配 {guess.support} 人 · 置信度{guess.confidence}）"
+    return f"{guess.workshop}（按命名规则推断 · 置信度{guess.confidence}）"
+
+
 def render_mapping_editor(analysis, bonus, items, options) -> None:
     counts: dict[str, int] = {}
     for item in items:
@@ -195,23 +214,22 @@ def render_mapping_editor(analysis, bonus, items, options) -> None:
     rows = []
     for group, count in sorted(counts.items(), key=lambda kv: -kv[1]):
         guess = analysis.mapping.get(group)
+        current = overrides.get(group, guess.workshop if guess else "")
         rows.append(
             {
                 "目前分组": group,
-                "待新增人数": count,
-                "自动建议": guess.workshop if guess else "",
-                "置信度": guess.confidence if guess else "低",
-                "依据": f"{guess.source}·样本{guess.support}" if guess else "无",
-                "最终车间": overrides.get(group, guess.workshop if guess else ""),
+                "待新增": count,
+                "自动建议": describe_guess(guess),
+                "最终车间": to_option(current, options),
             }
         )
     frame = pd.DataFrame(rows)
-    unknown = int((frame["最终车间"] == "").sum())
+    unknown = int((frame["最终车间"] == UNSET).sum())
     title = f"车间映射（{len(frame)} 个分组，"
     title += f"{unknown} 个待人工指定）" if unknown else "已全部对应）"
     with st.expander(title, expanded=bool(unknown)):
         st.caption(
-            "「自动建议」由两表已匹配人员反推得出，置信度低或空白的行请手工指定。"
+            "「自动建议」由两表已匹配人员反推得出。置信度低或显示「需人工指定」的行请在右侧下拉里选择；"
             "选「＋新建车间块」会在一线人员子表最下方新建该分组。"
         )
         edited = st.data_editor(
@@ -220,15 +238,18 @@ def render_mapping_editor(analysis, bonus, items, options) -> None:
             width="stretch",
             key="mapping_editor",
             column_config={
-                "最终车间": st.column_config.SelectboxColumn(options=options, required=False),
-                "待新增人数": st.column_config.NumberColumn(width="small"),
-                "置信度": st.column_config.TextColumn(width="small"),
+                "目前分组": st.column_config.TextColumn(width="medium"),
+                "待新增": st.column_config.NumberColumn(width="small"),
+                "自动建议": st.column_config.TextColumn(width="large"),
+                "最终车间": st.column_config.SelectboxColumn(
+                    options=options, required=True, width="medium"
+                ),
             },
-            disabled=["目前分组", "待新增人数", "自动建议", "置信度", "依据"],
+            disabled=["目前分组", "待新增", "自动建议"],
         )
         for group, before, after in zip(frame["目前分组"], frame["最终车间"], edited["最终车间"]):
-            if (after or "") != (before or ""):
-                overrides[group] = after or ""
+            if after != before:
+                overrides[group] = to_workshop(after)
 
 
 # --------------------------------------------------------------------------- #
@@ -281,36 +302,47 @@ def render_category(category, items, bonus, mapping, options) -> None:
         render_rows(category, items, mapping, editable)
 
 
-def row_payload(item, mapping) -> dict:
+def row_payload(item, mapping, options=None) -> dict:
     payload = item.as_dict()
-    payload["车间"] = effective_workshop(item, mapping)
+    workshop = effective_workshop(item, mapping)
+    payload["车间"] = to_option(workshop, options) if options else workshop
     return payload
 
 
 def render_table(category, items, mapping, options, editable) -> None:
+    """表格批量复核。
+
+    「应用」和「取消」是两个独立复选框，并且无条件按编辑结果回写。
+    这样表格状态与决策状态形成稳定不动点：既不会因为"没勾选"就把待定误判成取消，
+    也不依赖"和上一帧比较"这种脆弱逻辑。
+    """
     decisions = st.session_state["decisions"]
     overrides = st.session_state["workshop_override"]
-    order = ["应用", "姓名", "员工编号", "职务", "车间", "目前分组", "入职时间", "离职时间",
-             "离职/调出备注", "判定依据", "提示"]
+    order = ["应用", "取消", "姓名", "员工编号", "职务", "车间", "目前分组", "入职时间",
+             "离职时间", "离职/调出备注", "判定依据", "提示"]
     frame = pd.DataFrame(
         [
             {
                 "应用": decisions.get(item.label) == APPLY,
-                **{k: v for k, v in row_payload(item, mapping).items() if k in order},
+                "取消": decisions.get(item.label) == CANCEL,
+                **{k: v for k, v in row_payload(item, mapping, options).items() if k in order},
             }
             for item in items
         ]
     )[order]
     config = {
-        "应用": st.column_config.CheckboxColumn(width="small"),
+        "应用": st.column_config.CheckboxColumn("应用", width="small", help="纳入「已应用版」导出"),
+        "取消": st.column_config.CheckboxColumn("取消", width="small", help="从两个导出里都剔除"),
         "姓名": st.column_config.TextColumn(width="small"),
         "员工编号": st.column_config.TextColumn(width="small"),
         "职务": st.column_config.TextColumn(width="small"),
         "判定依据": st.column_config.TextColumn(width="large"),
     }
-    disabled = [column for column in order if column != "应用"]
+    disabled = [column for column in order if column not in ("应用", "取消")]
     if editable:
-        config["车间"] = st.column_config.SelectboxColumn(options=options, required=False)
+        config["车间"] = st.column_config.SelectboxColumn(
+            options=options, required=True, width="medium"
+        )
         disabled.remove("车间")
     version = st.session_state.get(f"ver_{category}", 0)
     edited = st.data_editor(
@@ -322,18 +354,21 @@ def render_table(category, items, mapping, options, editable) -> None:
         column_config=config,
         disabled=disabled,
     )
-    # 只写回真正被改动的行，否则未勾选的"待定"会被误判成"取消"
     for index, item in enumerate(items):
-        before = bool(frame["应用"].iloc[index])
-        after = bool(edited["应用"].iloc[index])
-        if after != before:
-            decisions[item.label] = APPLY if after else CANCEL
+        if bool(edited["应用"].iloc[index]):
+            decisions[item.label] = APPLY
+        elif bool(edited["取消"].iloc[index]):
+            decisions[item.label] = CANCEL
+        else:
+            decisions.pop(item.label, None)
         if editable:
-            was = frame["车间"].iloc[index] or ""
-            now = edited["车间"].iloc[index] or ""
-            if now != was:
-                overrides[item.label] = now
-    st.caption("勾选「应用」= 该人员纳入「已应用版」导出；取消勾选 = 从两个导出里都剔除。")
+            now = edited["车间"].iloc[index]
+            if now != frame["车间"].iloc[index]:
+                overrides[item.label] = to_workshop(now)
+    st.caption(
+        "「应用」= 纳入「已应用版」导出；「取消」= 从两个导出里都剔除；"
+        "两个都不勾 = 待定，只出现在「对照标记版」里。两个都勾时按「应用」处理。"
+    )
 
 
 def render_rows(category, items, mapping, editable) -> None:
@@ -342,19 +377,21 @@ def render_rows(category, items, mapping, editable) -> None:
     if pages > 1:
         page = int(
             st.number_input(
-                f"第几页（共 {pages} 页，每页 {PAGE_SIZE} 人）",
+                f"翻到第几页　（每页 {PAGE_SIZE} 人，共 {pages} 页 / {len(items)} 人）",
                 min_value=1,
                 max_value=pages,
                 value=1,
                 key=f"page_{category}",
             )
         )
+        first = (page - 1) * PAGE_SIZE + 1
+        st.caption(f"当前显示第 {first} ~ {min(page * PAGE_SIZE, len(items))} 人")
     badge = {APPLY: "✅ 已应用", CANCEL: "🚫 已取消", UNDECIDED: "⏳ 待定"}
     for item in items[(page - 1) * PAGE_SIZE : page * PAGE_SIZE]:
         payload = row_payload(item, mapping)
         cols = st.columns([2.2, 1.6, 0.9, 1.1, 1.1, 0.8, 0.8, 1.0])
         cols[0].markdown(f"**{item.name}**　`{item.eid}`")
-        cols[1].write(strip_new_block(payload["车间"]) or "—")
+        cols[1].write(payload["车间"] or "待指定")
         cols[2].write(item.duty or "—")
         cols[3].write(payload["入职时间"] or "—")
         cols[4].write(payload["离职时间"] or "—")
@@ -389,7 +426,7 @@ def render_export(bonus_bytes, bonus, analysis, include_pending) -> None:
     decisions = st.session_state["decisions"]
 
     def resolved(item):
-        item.workshop = strip_new_block(effective_workshop(item, analysis.mapping))
+        item.workshop = to_workshop(effective_workshop(item, analysis.mapping))
         return item
 
     selectable = [
@@ -411,7 +448,7 @@ def render_export(bonus_bytes, bonus, analysis, include_pending) -> None:
         )
         adds = [i for i in kept if i.action == "add"]
         removes = [i for i in kept if i.action == "remove"]
-        st.write(f"将新增 **{len(adds)}** 人（标绿），标记删除 **{len(removes)}** 人（标红）")
+        preview_counts(adds, removes, "标记删除")
         if st.button("生成对照标记版", type="primary", width="stretch"):
             generate("mark", bonus_bytes, bonus, adds, removes)
         offer_download("mark", bonus.file_name, "对照标记版")
@@ -424,7 +461,7 @@ def render_export(bonus_bytes, bonus, analysis, include_pending) -> None:
         )
         adds = [i for i in approved if i.action == "add"]
         removes = [i for i in approved if i.action == "remove"]
-        st.write(f"将直接插入 **{len(adds)}** 人，直接删除 **{len(removes)}** 人")
+        preview_counts(adds, removes, "直接删除")
         if st.button("生成已应用版", type="primary", width="stretch"):
             generate("apply", bonus_bytes, bonus, adds, removes)
         offer_download("apply", bonus.file_name, "已应用版")
@@ -433,6 +470,15 @@ def render_export(bonus_bytes, bonus, analysis, include_pending) -> None:
         "两个导出都保留原文件的全部子表、字体、行高列宽、公式、筛选和条件格式，"
         "只改动「一线人员」子表的人员行。打开后 Excel 会自动重算公式。"
     )
+
+
+def preview_counts(adds, removes, remove_label: str) -> None:
+    """预览数字必须和生成结果一致——未指定车间的人生成时会被跳过，这里就不能算进去。"""
+    ready = [item for item in adds if item.workshop]
+    pending = len(adds) - len(ready)
+    st.write(f"将新增 **{len(ready)}** 人，{remove_label} **{len(removes)}** 人")
+    if pending:
+        st.caption(f"另有 {pending} 人未指定车间，生成时会被跳过（在上方「车间映射」里指定即可纳入）")
 
 
 def generate(mode, bonus_bytes, bonus, adds, removes) -> None:
@@ -668,6 +714,25 @@ def main() -> None:
 
     adds = [item for item in analysis.items if item.action == "add"]
     options = build_options(bonus, {item.group for item in adds})
+    # 按当前生效的映射（含人工覆盖）实时统计，手工指定后这里的数字会立刻下降
+    pending: dict[str, int] = {}
+    for item in adds:
+        if not to_workshop(effective_workshop(item, analysis.mapping)):
+            pending[item.group] = pending.get(item.group, 0) + 1
+    if pending:
+        st.warning(
+            f"还有 {sum(pending.values())} 名待新增人员的分组没有对应车间，"
+            "请在下方「车间映射」里手工指定，否则导出时会被跳过。"
+        )
+        with st.expander(f"查看这 {len(pending)} 个待指定分组"):
+            st.dataframe(
+                pd.DataFrame(
+                    sorted(pending.items(), key=lambda kv: (-kv[1], kv[0])),
+                    columns=["目前分组", "待新增人数"],
+                ),
+                hide_index=True,
+                width="stretch",
+            )
     render_mapping_editor(analysis, bonus, adds, options)
 
     tabs = st.tabs(

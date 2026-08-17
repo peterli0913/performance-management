@@ -621,6 +621,7 @@ class Reconciliation:
     only_bonus: int = 0
     excluded_in_others: int = 0
     notes: list[str] = field(default_factory=list)
+    unmapped_groups: list[tuple[str, int]] = field(default_factory=list)
 
     @property
     def counts(self) -> dict[str, int]:
@@ -777,13 +778,12 @@ def reconcile(
         )
 
     notes = list(roster.notes) + list(bonus.notes)
-    unmapped = sorted(
-        guess.group
-        for guess in mapping.values()
-        if not guess.workshop and any(item.group == guess.group for item in items if item.action == "add")
+    pending = Counter(
+        item.group
+        for item in items
+        if item.action == "add" and not (mapping.get(item.group) and mapping[item.group].workshop)
     )
-    if unmapped:
-        notes.append("以下分组无法自动对应车间，需要在映射表里手工指定：" + "、".join(unmapped))
+    unmapped = sorted(pending.items(), key=lambda kv: (-kv[1], kv[0]))
 
     return Reconciliation(
         items=items,
@@ -795,4 +795,5 @@ def reconcile(
         only_bonus=len(bonus_keys - roster_keys),
         excluded_in_others=excluded,
         notes=notes,
+        unmapped_groups=unmapped,
     )

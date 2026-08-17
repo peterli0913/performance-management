@@ -127,11 +127,16 @@ def test_workshop_mapping_prefers_empirical_evidence(roster, bonus):
 
 
 def test_unmappable_groups_are_reported(result):
-    assert any("无法自动对应车间" in note for note in result.notes)
     unmapped = [item for item in result.items if item.action == "add" and not item.workshop]
     assert unmapped, "应当存在需要人工指定车间的人员"
     assert all("生产技术转移组" in i.group or "在其他厂区" in i.group or "安全组" in i.group
                or "计算机化设备保障组" == i.group for i in unmapped)
+    # 待指定分组要按人数汇总报出来，供界面渲染成清单
+    assert result.unmapped_groups
+    assert sum(count for _, count in result.unmapped_groups) == len(unmapped)
+    assert dict(result.unmapped_groups)["生产技术转移组(多肽)"] == 7
+    counts = [count for _, count in result.unmapped_groups]
+    assert counts == sorted(counts, reverse=True)
 
 
 def test_exclude_in_others_can_be_disabled(roster, bonus):
