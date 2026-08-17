@@ -861,7 +861,8 @@ class XlsxEditor:
         self._parts.pop(target)
         self._order = [name for name in self._order if name != target]
         types = self._parts["[Content_Types].xml"].decode("utf-8")
-        types = re.sub(r'<Override PartName="/xl/calcChain\.xml"[^/]*/>', "", types)
+        # ContentType 里本身带斜杠，字符类必须排除 ">" 而不是 "/"
+        types = re.sub(r'<Override PartName="/xl/calcChain\.xml"[^>]*?/>', "", types)
         self._parts["[Content_Types].xml"] = types.encode("utf-8")
         rels_path = "xl/_rels/workbook.xml.rels"
         rels = self._parts[rels_path].decode("utf-8")

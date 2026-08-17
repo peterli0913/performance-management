@@ -23,6 +23,7 @@ from .xlsx_surgery import (
 
 @dataclass
 class ExportSummary:
+    mode: str = "mark"
     added: int = 0
     removed: int = 0
     highlighted: int = 0
@@ -32,9 +33,14 @@ class ExportSummary:
     per_workshop: dict[str, int] = field(default_factory=dict)
 
     def text(self) -> str:
-        parts = [f"新增 {self.added} 人", f"{'删除' if self.removed else '标记删除'} {self.removed} 人"]
+        if self.mode == "apply":
+            parts = [f"直接插入 {self.added} 人", f"直接删除 {self.removed} 人"]
+        else:
+            parts = [f"新增 {self.added} 人（标绿）", f"标记删除 {self.removed} 人（标红）"]
         if self.new_blocks:
             parts.append("新建车间分组：" + "、".join(self.new_blocks))
+        if self.skipped:
+            parts.append(f"跳过 {len(self.skipped)} 人")
         return "；".join(parts)
 
 
@@ -52,7 +58,7 @@ def build_workbook(
     if mode not in ("mark", "apply"):
         raise ValueError("mode 只能是 mark 或 apply")
 
-    summary = ExportSummary()
+    summary = ExportSummary(mode=mode)
     editor = XlsxEditor(data)
     columns = bonus.columns
     for required in ("duty", "name", "eid", "hire"):
