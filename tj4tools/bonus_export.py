@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 
 from .roster import (
     ACTION_ADD,
+    ACTION_MOVE,
     ACTION_REMOVE,
     ACTION_UPDATE,
     NEW_BLOCK_SENTINEL,
@@ -58,8 +59,10 @@ class ExportSummary:
     added: int = 0
     removed: int = 0
     updated: int = 0
+    moved: int = 0
     interns: int = 0
     new_blocks: list[str] = field(default_factory=list)
+    new_other_workshops: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     per_workshop: dict[str, int] = field(default_factory=dict)
@@ -70,6 +73,8 @@ class ExportSummary:
             parts = [f"直接插入 {self.added} 人（红字）", f"直接删除 {self.removed} 人"]
         else:
             parts = [f"新增 {self.added} 人（标绿）", f"标记删除 {self.removed} 人（标红）"]
+        if self.moved:
+            parts.append(f"移到「副主任&工艺组长及其他」{self.moved} 人")
         if self.updated:
             parts.append(f"按清单更新 {self.updated} 人" + ("（标橙）" if self.mode == "mark" else ""))
         if self.interns:
@@ -87,6 +92,7 @@ def build_workbook(
     adds: list[DiffItem],
     removes: list[DiffItem],
     updates: list[DiffItem] | None = None,
+    moves: list[DiffItem] | None = None,
     *,
     mode: str = "mark",
     workshop_for=None,
@@ -106,7 +112,8 @@ def build_workbook(
     delete_rows: set[int] = set()
     highlights: list[Highlight] = []
 
-    for item in removes:
+    # 移出「一线人员」的人在这张表上的处理和删除一样
+    for item in list(removes) + list(moves or ()):
         if not item.frontline_row:
             summary.skipped.append(f"{item.name}（{item.eid}）没有原始行号，已跳过")
             continue
@@ -120,7 +127,10 @@ def build_workbook(
                     color=FILL_RED,
                 )
             )
-        summary.removed += 1
+        if item.action == ACTION_MOVE:
+            summary.moved += 1
+        else:
+            summary.removed += 1
 
     for item in updates or ():
         if not item.frontline_row:
@@ -220,17 +230,86 @@ def build_workbook(
         highlights=highlights,
         first_data_row=bonus.first_data_row,
     )
+    if moves:
+        _insert_into_others(editor, bonus, moves, mode, summary)
     summary.warnings.extend(editor.warnings)
     return editor.to_bytes(), summary
 
 
-def _new_row(item: DiffItem, columns: dict[str, str], mode: str) -> NewRow:
+def _insert_into_others(
+    editor: XlsxEditor, bonus: BonusFile, moves: list[DiffItem], mode: str, summary: ExportSummary
+) -> None:
+    """把职务已经不属于一线四种职务的人插进「副主任&工艺组长及其他」。
+
+    这张表的车间列**不合并**（每行都写车间名），所以不需要建合并区，
+    直接把车间当成普通一列写进去即可。
+    """
+    layout = bonus.others_layout
+    if layout is None:
+        summary.warnings.append("核算文件里没有「副主任&工艺组长及其他」子表，移动动作已跳过")
+        return
+    columns = layout.columns
+    buckets: dict[tuple[str, str], list[DiffItem]] = {}
+    for item in moves:
+        workshop = item.target_workshop or item.workshop
+        duty = str(item.new_values.get("职务") or item.duty)
+        buckets.setdefault((workshop, duty), []).append(item)
+
+    groups: list[InsertGroup] = []
+    known = layout.workshops
+    ordered = sorted(
+        buckets,
+        key=lambda pair: (
+            known.index(pair[0]) if pair[0] in known else len(known),
+            _duty_rank(layout.duty_order.get(pair[0], []), pair[1]),
+            pair[0],
+            pair[1],
+        ),
+    )
+    for workshop, duty in ordered:
+        items = buckets[(workshop, duty)]
+        anchor, precision = layout.anchor_for(workshop, duty)
+        if precision == "表尾" and workshop not in summary.new_other_workshops:
+            summary.new_other_workshops.append(workshop)
+        groups.append(
+            InsertGroup(
+                anchor_row=anchor,
+                template_row=_pick_template(layout.first_data_row, anchor, set()),
+                rows=[
+                    _new_row(item, columns, mode, workshop=workshop, duty=duty) for item in items
+                ],
+                new_block=False,
+            )
+        )
+        summary.interns += sum(1 for item in items if item.is_intern)
+    if summary.new_other_workshops:
+        summary.warnings.append(
+            f"「{layout.name}」里原本没有这些车间，相关人员已追加在该表人员区最下方："
+            + "、".join(summary.new_other_workshops)
+        )
+    editor.edit_rows(
+        layout.name,
+        inserts=groups,
+        first_data_row=layout.first_data_row,
+    )
+
+
+def _new_row(
+    item: DiffItem,
+    columns: dict[str, str],
+    mode: str,
+    workshop: str | None = None,
+    duty: str | None = None,
+) -> NewRow:
     values = {
-        columns["duty"]: item.duty,
-        columns["name"]: item.name,
-        columns["eid"]: item.eid,
-        columns["hire"]: item.hire_date,
+        columns["duty"]: duty or item.duty,
+        columns["name"]: str(item.new_values.get("姓名") or item.name),
+        columns["eid"]: str(item.new_values.get("员工编号") or item.eid),
+        columns["hire"]: item.new_values.get("入职日期") or item.hire_date,
     }
+    # 车间列不合并的子表（副主任&工艺组长及其他）需要每行都写车间名
+    if workshop is not None and "workshop" in columns:
+        values[columns["workshop"]] = workshop
     fills: dict[str, str] = {}
     fonts: dict[str, str] = {}
     if mode == "mark":
@@ -251,8 +330,9 @@ def _pick_template(start: int, end: int, deletes: set[int]) -> int:
 
 
 def split_by_action(items: list[DiffItem]):
-    """按动作把待处理人员拆成三组。"""
+    """按动作把待处理人员拆成四组：新增 / 删除 / 就地更新 / 移到另一子表。"""
     adds = [item for item in items if item.action == ACTION_ADD]
     removes = [item for item in items if item.action == ACTION_REMOVE]
     updates = [item for item in items if item.action == ACTION_UPDATE]
-    return adds, removes, updates
+    moves = [item for item in items if item.action == ACTION_MOVE]
+    return adds, removes, updates, moves

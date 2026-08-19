@@ -126,10 +126,46 @@ class Person:
     post: str = ""  # 清单的「岗位」列
     title: str = ""  # 清单的「职位」列
     is_intern: bool = False
+    intern_source: str = ""  # 「职位」或「备注」
 
     @property
     def key(self) -> tuple[str, str]:
         return (self.name, self.eid)
+
+
+@dataclass
+class SheetLayout:
+    """一张"按车间分组、车间内按职务分段"的人员子表的版式信息。"""
+
+    name: str
+    columns: dict[str, str] = field(default_factory=dict)
+    first_data_row: int = 2
+    last_data_row: int = 2
+    merged_workshop: bool = False
+    people: dict[tuple[str, str], Person] = field(default_factory=dict)
+    blocks: list[tuple[str, int, int]] = field(default_factory=list)
+    duty_anchors: dict[tuple[str, str], int] = field(default_factory=dict)
+    duty_order: dict[str, list[str]] = field(default_factory=dict)
+
+    @property
+    def workshops(self) -> list[str]:
+        return [block[0] for block in self.blocks]
+
+    def block_of(self, workshop: str) -> tuple[str, int, int] | None:
+        for block in self.blocks:
+            if block[0] == workshop:
+                return block
+        return None
+
+    def anchor_for(self, workshop: str, duty: str) -> tuple[int, str]:
+        """返回 (插入锚点行, 定位精度)：职务段末 / 车间块末 / 全表末。"""
+        anchor = self.duty_anchors.get((workshop, canon_duty(duty)))
+        if anchor is not None:
+            return anchor, "职务"
+        block = self.block_of(workshop)
+        if block is not None:
+            return block[2], "车间"
+        return self.last_data_row, "表尾"
 
 
 @dataclass
@@ -156,6 +192,7 @@ class BonusFile:
     frontline_order: list[tuple[str, str]] = field(default_factory=list)
     blocks: list[tuple[str, int, int]] = field(default_factory=list)
     others: dict[tuple[str, str], Person] = field(default_factory=dict)
+    others_layout: SheetLayout | None = None
     first_data_row: int = 3
     last_data_row: int = 3
     columns: dict[str, str] = field(default_factory=dict)
@@ -245,14 +282,18 @@ def _staff_header(sheet):
 
 
 INTERN_TITLE = "实习生"
+# 有的实习生「职位」和「岗位」都写的是实际岗位，只有备注里写着"校招实习生"
+INTERN_REMARK_RE = re.compile(r"实习")
 
 
 def _parse_staff_sheet(sheet, duty_field: str, include_interns: bool = False):
     """返回 (全部人员, 目标职务人员)。
 
-    实习生的「职位」记作实习生、「岗位」记作实际岗位（示例文件里全是操作工）。
-    按「职位」过滤时实习生天然被排除；``include_interns`` 打开后改用他们的岗位，
-    这样实习生也能进目标名单，并在导出时用黄色底纹标出来。
+    实习生有两种写法：
+      * 「职位」直接写「实习生」（此时「岗位」才是实际岗位）——按职位过滤会天然排除，
+        ``include_interns`` 打开后改用岗位把他们捞回来；
+      * 「职位」「岗位」都写实际岗位，只有**备注**里写着"校招实习生"——这些人本来就在
+        目标名单里，只是需要标出来，所以不受 ``include_interns`` 影响。
     """
     _, cols = _staff_header(sheet)
     everyone: dict[tuple[str, str], Person] = {}
@@ -263,9 +304,11 @@ def _parse_staff_sheet(sheet, duty_field: str, include_interns: bool = False):
             continue
         post = clean_text(_get(row, cols["post"]))
         title = clean_text(_get(row, cols["title"]))
-        is_intern = title == INTERN_TITLE
+        remark = clean_text(_get(row, cols["remark"]))
+        by_title = title == INTERN_TITLE
+        by_remark = bool(INTERN_REMARK_RE.search(remark))
         duty_raw = title if duty_field == "职位" else post
-        if is_intern and include_interns and not is_target_duty(duty_raw):
+        if by_title and include_interns and not is_target_duty(duty_raw):
             duty_raw = post
         person = Person(
             name=name,
@@ -274,14 +317,16 @@ def _parse_staff_sheet(sheet, duty_field: str, include_interns: bool = False):
             duty_raw=duty_raw,
             group=clean_text(_get(row, cols["group"])),
             hire_date=parse_date(_get(row, cols["hire"])),
-            remark=clean_text(_get(row, cols["remark"])),
+            remark=remark,
             row=offset,
             post=post,
             title=title,
-            is_intern=is_intern,
+            is_intern=by_title or by_remark,
+            intern_source="职位" if by_title else ("备注" if by_remark else ""),
         )
         everyone[person.key] = person
-        if is_target_duty(duty_raw) and (include_interns or not is_intern):
+        # 只有"职位写实习生"的人受开关控制；备注型实习生的职位本来就是目标职务
+        if is_target_duty(duty_raw) and (include_interns or not by_title):
             targets[person.key] = person
     return everyone, targets
 
@@ -368,7 +413,8 @@ def parse_bonus(data: bytes, file_name: str) -> BonusFile:
         if others is None:
             result.notes.append(f"未找到「{SHEET_OTHERS}」子表，无法排除已在该表的人员")
         else:
-            result.others = _parse_others(others)
+            result.others_layout = _parse_others(others)
+            result.others = result.others_layout.people
     finally:
         workbook.close()
     return result
@@ -510,32 +556,84 @@ def _build_duty_anchors(result: BonusFile) -> None:
             )
 
 
-def _parse_others(sheet) -> dict[tuple[str, str], Person]:
+def _parse_others(sheet) -> SheetLayout:
+    """解析「副主任&工艺组长及其他」。
+
+    这张表的车间列**不合并**（每行都写车间名），而且第 130 行之后是混排在
+    A~D 列的参照表（产能利用率、基础档位 A/B/C/D，被 L 列的 HLOOKUP 引用），
+    所以遇到第一个空姓名行就必须停下，否则会把参照表当成人员。
+    """
+    from openpyxl.utils import get_column_letter
+
     header = [cell.value for cell in sheet[1]]
-    cols = {
+    indexes = {
         "workshop": find_col(header, "车间"),
         "duty": find_col(header, "职务", "岗位"),
         "name": find_col(header, "姓名"),
         "eid": find_col(header, "员工编号", "员工号"),
         "hire": find_col(header, "入职日期", "入职时间"),
     }
-    out: dict[tuple[str, str], Person] = {}
+    layout = SheetLayout(
+        name=sheet.title,
+        columns={
+            key: get_column_letter(index + 1) for key, index in indexes.items() if index is not None
+        },
+        first_data_row=2,
+        merged_workshop=False,
+    )
+    order: list[str] = []
+    spans: dict[str, list[int]] = {}
     for offset, row in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=2):
-        name = norm_name(_get(row, cols["name"]))
+        name = norm_name(_get(row, indexes["name"]))
         if not name:
-            continue
+            break
+        workshop = clean_text(_get(row, indexes["workshop"]))
         person = Person(
             name=name,
-            eid=norm_eid(_get(row, cols["eid"])),
-            duty=canon_duty(_get(row, cols["duty"])),
-            duty_raw=clean_text(_get(row, cols["duty"])),
+            eid=norm_eid(_get(row, indexes["eid"])),
+            duty=canon_duty(_get(row, indexes["duty"])),
+            duty_raw=clean_text(_get(row, indexes["duty"])),
             group="",
-            hire_date=parse_date(_get(row, cols["hire"])),
+            hire_date=parse_date(_get(row, indexes["hire"])),
             row=offset,
-            workshop=clean_text(_get(row, cols["workshop"])),
+            workshop=workshop,
         )
-        out.setdefault(person.key, person)
-    return out
+        layout.people.setdefault(person.key, person)
+        layout.last_data_row = offset
+        if workshop not in spans:
+            spans[workshop] = [offset, offset]
+            order.append(workshop)
+        else:
+            spans[workshop][1] = offset
+    layout.blocks = [(name, spans[name][0], spans[name][1]) for name in order]
+    _fill_duty_anchors(layout)
+    return layout
+
+
+def _fill_duty_anchors(layout: SheetLayout) -> None:
+    by_row = {person.row: person for person in layout.people.values()}
+    for workshop, start, end in layout.blocks:
+        runs: list[tuple[str, int, int]] = []
+        for row in range(start, end + 1):
+            person = by_row.get(row)
+            if person is None:
+                continue
+            if runs and runs[-1][0] == person.duty and runs[-1][2] == row - 1:
+                runs[-1] = (person.duty, runs[-1][1], row)
+            else:
+                runs.append((person.duty, row, row))
+        best: dict[str, tuple[int, int]] = {}
+        for duty, run_start, run_end in runs:
+            size = run_end - run_start + 1
+            if duty not in best or size > best[duty][0]:
+                best[duty] = (size, run_end)
+        for duty, (_, run_end) in best.items():
+            layout.duty_anchors[(workshop, duty)] = run_end
+        seen: list[str] = []
+        for duty, _, _ in runs:
+            if duty not in seen:
+                seen.append(duty)
+        layout.duty_order[workshop] = seen
 
 
 # --------------------------------------------------------------------------- #
@@ -646,6 +744,12 @@ def _rule_workshop(group: str, workshops: set[str], mapping: dict[str, WorkshopG
 ACTION_ADD = "add"
 ACTION_REMOVE = "remove"
 ACTION_UPDATE = "update"
+ACTION_MOVE = "move"  # 从「一线人员」移到「副主任&工艺组长及其他」
+
+INTERN_SENIOR = "入职超过3个月"
+INTERN_JUNIOR = "入职不到3个月"
+INTERN_UNKNOWN = "入职日期异常"
+INTERN_MONTHS = 3
 
 # 「待定·核算有清单无」如果能在清单里找到同一个人，改的就是信息而不是删人；
 # 这几个字段会按清单值覆盖核算表里的原行。
@@ -671,9 +775,14 @@ class DiffItem:
     frontline_row: int = 0
     roster_row: int = 0
     is_intern: bool = False
+    intern_source: str = ""
+    intern_class: str = ""
     action: str = ACTION_ADD
     updates: dict[str, tuple[str, str]] = field(default_factory=dict)
     new_values: dict[str, object] = field(default_factory=dict)
+    target_sheet: str = ""
+    target_workshop: str = ""
+    target_workshop_source: str = ""
 
     @property
     def label(self) -> str:
@@ -682,6 +791,22 @@ class DiffItem:
     @property
     def update_text(self) -> str:
         return "；".join(f"{name} {old or '空'}→{new or '空'}" for name, (old, new) in self.updates.items())
+
+    @property
+    def action_text(self) -> str:
+        if self.action == ACTION_MOVE:
+            return f"移到「{self.target_sheet}」·{self.target_workshop or '待指定车间'}"
+        if self.action == ACTION_UPDATE:
+            return "保留在「一线人员」并按清单更新"
+        if self.action == ACTION_REMOVE:
+            return "从「一线人员」删除"
+        return "新增到「一线人员」"
+
+    @property
+    def intern_text(self) -> str:
+        if not self.is_intern:
+            return ""
+        return f"{self.intern_class}（据{self.intern_source}）" if self.intern_class else "是"
 
     def as_dict(self) -> dict:
         return {
@@ -695,7 +820,9 @@ class DiffItem:
             "离职时间": fmt_date(self.leave_date) or self.leave_raw,
             "离职/调出备注": self.departure_remark,
             "清单数据差异": self.update_text,
-            "实习生": "是" if self.is_intern else "",
+            "动作": self.action_text,
+            "实习生": self.intern_text,
+            "实习生分类": self.intern_class,
             "判定依据": self.reason,
             "提示": "；".join(self.flags),
             "_key": self.label,
@@ -708,6 +835,8 @@ class Reconciliation:
     ref_date: _dt.date | None
     new_hire_since: _dt.date | None
     mapping: dict[str, WorkshopGuess]
+    intern_asof: _dt.date | None = None
+    intern_months: int = INTERN_MONTHS
     matched: int = 0
     only_roster: int = 0
     only_bonus: int = 0
@@ -723,6 +852,18 @@ class Reconciliation:
 
     def by_category(self, category: str) -> list[DiffItem]:
         return [item for item in self.items if item.category == category]
+
+    def by_action(self, action: str) -> list[DiffItem]:
+        return [item for item in self.items if item.action == action]
+
+    @property
+    def intern_counts(self) -> dict[str, int]:
+        counter = Counter(item.intern_class for item in self.items if item.is_intern)
+        return {
+            key: counter.get(key, 0)
+            for key in (INTERN_SENIOR, INTERN_JUNIOR, INTERN_UNKNOWN)
+            if counter.get(key, 0)
+        }
 
     def category_of(self, name: str, eid: str) -> str | None:
         target = (norm_name(name), norm_eid(eid))
@@ -746,8 +887,14 @@ def _match_in_roster(key, roster: RosterFile, by_eid, by_name) -> Person | None:
     return None
 
 
-def _attach_update(item: DiffItem, current: Person, source: Person) -> None:
-    """把"按清单数据更新"所需的新值与差异说明挂到 item 上。"""
+def _attach_update(
+    item: DiffItem, current: Person, source: Person, others_workshops: dict[str, str]
+) -> None:
+    """把"按清单数据更新"所需的新值与差异说明挂到 item 上。
+
+    更新后如果职务已经不属于一线的四种职务，这个人就该挪到
+    「副主任&工艺组长及其他」子表，动作从 update 变成 move。
+    """
     pairs = (
         ("姓名", current.name, source.name),
         ("员工编号", current.eid, source.eid),
@@ -762,13 +909,58 @@ def _attach_update(item: DiffItem, current: Person, source: Person) -> None:
     }
     item.updates = {name: (old, new) for name, old, new in pairs if old != new}
     item.is_intern = source.is_intern
-    item.action = ACTION_UPDATE
+    item.intern_source = source.intern_source
     item.roster_row = source.row
     item.reason += (
         f"；「{SHEET_PRODUCTION}」第 {source.row} 行有同一人"
-        f"（{source.name} {source.eid} 职位「{source.title or source.duty_raw}」），"
-        "可按清单数据更新而不是删除"
+        f"（{source.name} {source.eid} 职位「{source.title or source.duty_raw}」）"
     )
+    if is_target_duty(source.duty_raw):
+        item.action = ACTION_UPDATE
+        item.reason += "，职务仍属一线四种职务，按清单更新后保留"
+        return
+    item.action = ACTION_MOVE
+    item.target_sheet = SHEET_OTHERS
+    mapped = others_workshops.get(source.group)
+    item.target_workshop = mapped or current.workshop
+    item.target_workshop_source = "经验映射" if mapped else "沿用一线车间"
+    item.reason += f"，职务「{source.duty}」不属一线四种职务，移到「{SHEET_OTHERS}」"
+
+
+def _classify_intern(item: DiffItem, asof: _dt.date | None, months: int) -> None:
+    """按判断日期把实习生分成"入职超过 N 个月"和"入职不到 N 个月"。"""
+    if not item.is_intern:
+        return
+    if item.hire_date is None or asof is None or item.hire_date >= asof:
+        item.intern_class = INTERN_UNKNOWN
+        item.flags.append(
+            f"实习生（据{item.intern_source}），入职 {fmt_date(item.hire_date) or '未知'} "
+            f"不早于判断日期 {asof}，无法计算入职时长"
+        )
+        return
+    cutoff = months_before(asof, months)
+    item.intern_class = INTERN_SENIOR if item.hire_date <= cutoff else INTERN_JUNIOR
+    item.flags.append(
+        f"实习生（据{item.intern_source}），{item.intern_class}"
+        f"（按 {asof} 算，{months} 个月分界为 {cutoff}）"
+    )
+
+
+def build_others_workshop_map(roster: RosterFile, bonus: BonusFile) -> dict[str, str]:
+    """「目前分组」→「副主任&工艺组长及其他」的车间名。
+
+    两张子表的车间叫法不一样（一线人员写「11号楼D级车间」，这张表写「11号楼车间D级区域」），
+    所以同样用两表已匹配的人反推，而不是猜。
+    """
+    layout = bonus.others_layout
+    if layout is None:
+        return {}
+    votes: dict[str, Counter] = defaultdict(Counter)
+    for key, person in layout.people.items():
+        source = roster.production_all.get(key)
+        if source is not None and source.group and person.workshop:
+            votes[source.group][person.workshop] += 1
+    return {group: counter.most_common(1)[0][0] for group, counter in votes.items()}
 
 
 def reconcile(
@@ -777,14 +969,24 @@ def reconcile(
     *,
     ref_date: _dt.date | None = None,
     new_hire_since: _dt.date | None = None,
+    intern_asof: _dt.date | None = None,
+    intern_months: int = INTERN_MONTHS,
     exclude_in_others: bool = True,
     mapping: dict[str, WorkshopGuess] | None = None,
 ) -> Reconciliation:
-    """``new_hire_since``：入职时间不早于该日期的算新入职；默认为参照日期前一个月。"""
+    """对账。
+
+    ``new_hire_since``：新入职判定窗口的起点；入职时间需落在
+    ``[new_hire_since, ref_date]`` 之间才算新入职。
+    ``intern_asof``：实习生"入职是否满 N 个月"的判断日期，默认取参照日期。
+    """
     anchor = ref_date or roster.ref_date
     if new_hire_since is None:
         new_hire_since = months_before(anchor, 1) if anchor else None
+    if intern_asof is None:
+        intern_asof = anchor
     mapping = mapping or build_workshop_mapping(roster, bonus)
+    others_workshops = build_others_workshop_map(roster, bonus)
 
     roster_keys = set(roster.production)
     bonus_keys = set(bonus.frontline)
@@ -831,43 +1033,48 @@ def reconcile(
         change = roster.changes.get(key)
         reasons: list[str] = []
         is_new = False
-        if person.hire_date and new_hire_since and person.hire_date >= new_hire_since:
+        in_window = (
+            person.hire_date is not None
+            and new_hire_since is not None
+            and person.hire_date >= new_hire_since
+            and (anchor is None or person.hire_date < anchor)
+        )
+        if in_window:
             is_new = True
-            reasons.append(f"入职 {person.hire_date} 不早于窗口日期 {new_hire_since}")
+            reasons.append(f"入职 {person.hire_date} 落在 {new_hire_since} ~ {anchor} 之间")
         if change is not None and change["leave_blank"]:
             is_new = True
             reasons.append(f"「{SHEET_CHANGES}」第 {change['row']} 行（{change['kind']}）且离职时间为空")
         elif change is not None:
             reasons.append(f"「{SHEET_CHANGES}」第 {change['row']} 行已有离职时间 {change['leave_raw']}")
-        if person.hire_date and anchor and person.hire_date > anchor:
-            flags.append(f"入职时间 {person.hire_date} 晚于参照日期 {anchor}")
-        if person.is_intern:
-            flags.append("实习生")
+        if person.hire_date and anchor and person.hire_date >= anchor:
+            flags.append(f"入职时间 {person.hire_date} 不早于参照日期 {anchor}")
         if not reasons:
             reasons.append(
-                f"入职 {fmt_date(person.hire_date) or '未知'} 早于窗口日期 {new_hire_since}，"
+                f"入职 {fmt_date(person.hire_date) or '未知'} 不在 {new_hire_since} ~ {anchor} 之间，"
                 f"且「{SHEET_CHANGES}」无在职记录"
             )
         guess = mapping.get(person.group)
-        items.append(
-            DiffItem(
-                key=key,
-                name=person.name,
-                eid=person.eid,
-                category=CATEGORY_NEW if is_new else CATEGORY_PENDING_ADD,
-                duty=person.duty,
-                duty_raw=person.duty_raw,
-                group=person.group,
-                workshop=guess.workshop if guess else "",
-                hire_date=person.hire_date,
-                departure_remark=person.remark,
-                reason="；".join(reasons),
-                flags=flags,
-                roster_row=person.row,
-                is_intern=person.is_intern,
-                action=ACTION_ADD,
-            )
+        item = DiffItem(
+            key=key,
+            name=person.name,
+            eid=person.eid,
+            category=CATEGORY_NEW if is_new else CATEGORY_PENDING_ADD,
+            duty=person.duty,
+            duty_raw=person.duty_raw,
+            group=person.group,
+            workshop=guess.workshop if guess else "",
+            hire_date=person.hire_date,
+            departure_remark=person.remark,
+            reason="；".join(reasons),
+            flags=flags,
+            roster_row=person.row,
+            is_intern=person.is_intern,
+            intern_source=person.intern_source,
+            action=ACTION_ADD,
         )
+        _classify_intern(item, intern_asof, intern_months)
+        items.append(item)
 
     # --- 核算有、清单无 ------------------------------------------------- #
     for key in sorted(bonus_keys - roster_keys, key=lambda k: bonus.frontline[k].row):
@@ -926,7 +1133,8 @@ def reconcile(
             # 这类人多半没离职，只是职务变了或姓名录错；能在清单里找到本人就改成"更新信息"
             source = _match_in_roster(key, roster, eid_to_roster_all, name_to_roster_all)
             if source is not None:
-                _attach_update(item, person, source)
+                _attach_update(item, person, source, others_workshops)
+                _classify_intern(item, intern_asof, intern_months)
         items.append(item)
 
     # 同一个人可能同时落在两边：清单里叫「曹睿晟」、核算表里叫「曹静旺」（同一个员工编号）。
@@ -966,6 +1174,8 @@ def reconcile(
         items=items,
         ref_date=anchor,
         new_hire_since=new_hire_since,
+        intern_asof=intern_asof,
+        intern_months=intern_months,
         mapping=mapping,
         matched=len(matched),
         only_roster=len(roster_keys - bonus_keys),

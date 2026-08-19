@@ -15,11 +15,12 @@ import streamlit as st
 from tj4tools.bonus_export import build_workbook, split_by_action
 from tj4tools.db import Workspace
 from tj4tools.ingest import ingest_files
-from tj4tools.normalize import date_from_filename, months_before
+from tj4tools.normalize import date_from_filename, fmt_date, months_before
 from tj4tools.roster import (
     ACTION_ADD,
     ADD_CATEGORIES,
     CATEGORIES,
+    INTERN_MONTHS,
     CATEGORY_LEFT,
     CATEGORY_NEW,
     CATEGORY_PENDING_ADD,
@@ -65,6 +66,7 @@ def cached_analyze(
     duty_field: str,
     ref_date: dt.date | None,
     new_hire_since: dt.date | None,
+    intern_asof: dt.date | None,
     exclude_others: bool,
     include_interns: bool,
 ):
@@ -78,6 +80,7 @@ def cached_analyze(
         bonus,
         ref_date=ref_date,
         new_hire_since=new_hire_since,
+        intern_asof=intern_asof,
         exclude_in_others=exclude_others,
         mapping=mapping,
     )
@@ -278,17 +281,71 @@ def choice_labels(category: str) -> tuple[str, str]:
     return CHOICE_LABELS.get(category, DEFAULT_LABELS)
 
 
+def render_auto_applied(category, items) -> None:
+    """「待定·核算有清单无」不需要人工复核：全部按清单数据处理，只把清单和动作列出来。"""
+    if not items:
+        st.success(f"没有「{category}」人员")
+        return
+    moves = [item for item in items if item.action == "move"]
+    keeps = [item for item in items if item.action != "move"]
+    metrics = st.columns([1, 1, 1, 4])
+    metrics[0].metric("总数", len(items))
+    metrics[1].metric("保留并更新", len(keeps))
+    metrics[2].metric("移到副主任表", len(moves))
+    st.info(
+        "这些人在核算表里有、在清单目标职务里没有，但都能在「生产部」里找到本人"
+        "（多为职务变动或姓名录错）。**全部按人员清单的信息处理，无需复核**：\n\n"
+        "- 更新后职务仍是助工/操作工/工程师/班长 → **保留在「一线人员」**并按清单改写\n"
+        "- 更新后职务不是这四种 → **移到「副主任&工艺组长及其他」子表**（从一线人员移除）"
+    )
+    frame = pd.DataFrame(
+        [
+            {
+                "姓名": item.name,
+                "员工编号": item.eid,
+                "原一线车间": item.workshop,
+                "核算职务": item.duty,
+                "清单职务": str(item.new_values.get("职务") or ""),
+                "动作": item.action_text,
+                "目标车间依据": item.target_workshop_source,
+                "修改内容": item.update_text or "（无字段变化）",
+                "入职时间": fmt_date(item.hire_date),
+                "实习生": item.intern_text,
+                "判定依据": item.reason,
+            }
+            for item in items
+        ]
+    )
+    st.dataframe(
+        frame,
+        hide_index=True,
+        width="stretch",
+        height=min(640, 90 + 35 * len(frame)),
+        column_config={
+            "姓名": st.column_config.TextColumn(width="small"),
+            "员工编号": st.column_config.TextColumn(width="small"),
+            "动作": st.column_config.TextColumn(width="large"),
+            "判定依据": st.column_config.TextColumn(width="large"),
+        },
+    )
+    unmapped = [item for item in moves if not item.target_workshop]
+    if unmapped:
+        st.warning(
+            "以下人员没能确定在副主任表里的车间，导出时会追加在该表最下方："
+            + "、".join(f"{i.name}({i.eid})" for i in unmapped)
+        )
+    fallback = sorted({i.target_workshop for i in moves if i.target_workshop_source == "沿用一线车间"})
+    if fallback:
+        st.caption(
+            "副主任表里原本没有这些车间，相关人员会追加在该表人员区最下方并写上车间名："
+            + "、".join(fallback)
+        )
+
+
 def render_category(category, items, bonus, mapping, options) -> None:
     if not items:
         st.success(f"没有「{category}」人员")
         return
-
-    if category == CATEGORY_PENDING_DEL:
-        st.info(
-            "这些人在核算表里有、在清单目标职务里没有，但都能在「生产部」里找到本人"
-            "（多为职务变动或姓名录错）。**用清单数据** = 按清单改写这一行的姓名/员工编号/"
-            "职务/入职日期；**沿用核算数据** = 保持核算表原样不动。"
-        )
 
     decisions = st.session_state["decisions"]
     applied = sum(1 for item in items if decisions.get(item.label) == APPLY)
@@ -480,8 +537,11 @@ def render_export(bonus_bytes, bonus, analysis, include_pending) -> None:
         if item.category in (CATEGORY_NEW, CATEGORY_LEFT)
         or include_pending.get(item.category, True)
     ]
-    kept = [resolved(i) for i in selectable if decisions.get(i.label) != CANCEL]
-    approved = [resolved(i) for i in selectable if decisions.get(i.label) == APPLY]
+    # 「待定·核算有清单无」按需求全部自动按清单处理，不参与人工复核
+    auto = [resolved(i) for i in selectable if i.category == CATEGORY_PENDING_DEL]
+    reviewed = [i for i in selectable if i.category != CATEGORY_PENDING_DEL]
+    kept = auto + [resolved(i) for i in reviewed if decisions.get(i.label) != CANCEL]
+    approved = auto + [resolved(i) for i in reviewed if decisions.get(i.label) == APPLY]
 
     left, right = st.columns(2)
     with left:
@@ -491,10 +551,10 @@ def render_export(bonus_bytes, bonus, analysis, include_pending) -> None:
             "姓名与员工编号填**绿色**；需删除的人员保留原行、填**红色**；"
             "按清单更新的人员就地改值、改动的单元格填**橙色**。被点「取消」的人不纳入。"
         )
-        adds, removes, updates = split_by_action(kept)
-        preview_counts(adds, removes, updates, "标记删除")
+        adds, removes, updates, moves = split_by_action(kept)
+        preview_counts(adds, removes, updates, moves, "标记删除")
         if st.button("生成对照标记版", type="primary", width="stretch"):
-            generate("mark", bonus_bytes, bonus, adds, removes, updates)
+            generate("mark", bonus_bytes, bonus, adds, removes, updates, moves)
         offer_download("mark", bonus.file_name, "对照标记版")
 
     with right:
@@ -503,24 +563,26 @@ def render_export(bonus_bytes, bonus, analysis, include_pending) -> None:
             "只处理被点「应用」的人员：删除类**直接删行**、新增类**直接插入对应位置**"
             "且内容用**红色字体**、更新类就地改成清单里的值。"
         )
-        adds, removes, updates = split_by_action(approved)
-        preview_counts(adds, removes, updates, "直接删除")
+        adds, removes, updates, moves = split_by_action(approved)
+        preview_counts(adds, removes, updates, moves, "直接删除")
         if st.button("生成已应用版", type="primary", width="stretch"):
-            generate("apply", bonus_bytes, bonus, adds, removes, updates)
+            generate("apply", bonus_bytes, bonus, adds, removes, updates, moves)
         offer_download("apply", bonus.file_name, "已应用版")
 
     st.info(
-        "两个导出都保留原文件的全部子表、字体、行高列宽、公式、筛选和条件格式，"
-        "只改动「一线人员」子表的人员行；清单里「职位」为实习生的人，职务列填**黄色**底纹。"
-        "打开后 Excel 会自动重算公式。"
+        "两个导出都保留原文件的全部子表、字体、行高列宽、公式、筛选和条件格式；"
+        "改动只发生在「一线人员」和「副主任&工艺组长及其他」两张子表的人员行。"
+        "实习生的职务列填**黄色**底纹。打开后 Excel 会自动重算公式。"
     )
 
 
-def preview_counts(adds, removes, updates, remove_label: str) -> None:
+def preview_counts(adds, removes, updates, moves, remove_label: str) -> None:
     """预览数字必须和生成结果一致——未指定车间的人生成时会被跳过，这里就不能算进去。"""
     ready = [item for item in adds if item.workshop]
     pending = len(adds) - len(ready)
     text = f"将新增 **{len(ready)}** 人，{remove_label} **{len(removes)}** 人"
+    if moves:
+        text += f"，移到副主任表 **{len(moves)}** 人"
     if updates:
         text += f"，按清单更新 **{len(updates)}** 人"
     st.write(text)
@@ -528,14 +590,14 @@ def preview_counts(adds, removes, updates, remove_label: str) -> None:
         st.caption(f"另有 {pending} 人未指定车间，生成时会被跳过（在上方「车间映射」里指定即可纳入）")
 
 
-def generate(mode, bonus_bytes, bonus, adds, removes, updates=()) -> None:
-    if not adds and not removes and not updates:
+def generate(mode, bonus_bytes, bonus, adds, removes, updates=(), moves=()) -> None:
+    if not adds and not removes and not updates and not moves:
         st.warning("没有需要处理的人员")
         return
     try:
         with st.spinner("正在生成 Excel…"):
             data, summary = build_workbook(
-                bonus_bytes, bonus, adds, removes, list(updates), mode=mode
+                bonus_bytes, bonus, adds, removes, list(updates), list(moves), mode=mode
             )
     except Exception as exc:  # noqa: BLE001 - 生成失败要给出可读原因
         st.error(f"生成失败：{type(exc).__name__}: {exc}")
@@ -669,7 +731,8 @@ def render_sidebar(names, guess_roster, guess_bonus, intern_total):
         include_interns = st.checkbox(
             f"纳入实习生（{intern_total} 人，导出时职务列标黄底）",
             value=True,
-            help="实习生按「岗位」列的实际岗位归入对应职务分组。",
+            help="「职位」写实习生的人按「岗位」列的实际岗位归入职务分组；"
+                 "备注里写着「校招实习生」的人本来就在名单里，不受这个开关影响。",
         )
         detected = date_from_filename(roster_name)
         ref_date = st.date_input(
@@ -684,9 +747,19 @@ def render_sidebar(names, guess_roster, guess_bonus, intern_total):
             "新入职判定窗口日期",
             value=default_since,
             format="YYYY-MM-DD",
-            help="入职时间不早于这一天的算新入职；默认是参照日期往前一个月。",
+            help="窗口的起点；入职时间要落在这一天和参照日期之间才算新入职。",
         )
-        st.caption(f"即：入职时间 ≥ {new_hire_since} 的算新入职员工")
+        st.caption(f"即：入职时间在 {new_hire_since} ~ {ref_date} 之间的算新入职员工")
+        intern_asof = st.date_input(
+            "实习生判断日期",
+            value=ref_date,
+            format="YYYY-MM-DD",
+            help="按这一天计算实习生的入职时长，分成入职超过 3 个月和不到 3 个月。",
+        )
+        st.caption(
+            f"即：入职不晚于 {months_before(intern_asof, INTERN_MONTHS)} 的实习生算"
+            f"「入职超过 {INTERN_MONTHS} 个月」"
+        )
         exclude_others = st.checkbox(
             "排除已在「副主任&工艺组长及其他」子表的人",
             value=True,
@@ -710,6 +783,7 @@ def render_sidebar(names, guess_roster, guess_bonus, intern_total):
         "include_interns": include_interns,
         "ref_date": ref_date,
         "new_hire_since": new_hire_since,
+        "intern_asof": intern_asof,
         "exclude_others": exclude_others,
         "include_pending": include_pending,
     }
@@ -761,6 +835,7 @@ def main() -> None:
             options_["duty_field"],
             options_["ref_date"],
             options_["new_hire_since"],
+            options_["intern_asof"],
             options_["exclude_others"],
             options_["include_interns"],
         )
@@ -777,10 +852,16 @@ def main() -> None:
     metrics[4].metric("待定·需核实", counts[CATEGORY_PENDING_DEL])
     metrics[5].metric("已在其他子表", analysis.excluded_in_others)
     st.caption(
-        f"参照日期 {analysis.ref_date}，入职时间 ≥ {analysis.new_hire_since} 的算新入职；"
-        f"清单目标职务 {analysis.matched + analysis.only_roster} 人，"
+        f"参照日期 {analysis.ref_date}，入职时间在 {analysis.new_hire_since} ~ {analysis.ref_date} "
+        f"之间的算新入职；清单目标职务 {analysis.matched + analysis.only_roster} 人，"
         f"核算一线人员 {analysis.matched + analysis.only_bonus} 人。"
     )
+    interns = analysis.intern_counts
+    if interns:
+        st.caption(
+            f"实习生 {sum(interns.values())} 人（按 {analysis.intern_asof} 判断）："
+            + "、".join(f"{name} {count} 人" for name, count in interns.items())
+        )
     for note in analysis.notes:
         st.warning(note)
 
@@ -819,7 +900,12 @@ def main() -> None:
     )
     for tab, category in zip(tabs, CATEGORIES):
         with tab:
-            render_category(category, analysis.by_category(category), bonus, analysis.mapping, options)
+            if category == CATEGORY_PENDING_DEL:
+                render_auto_applied(category, analysis.by_category(category))
+            else:
+                render_category(
+                    category, analysis.by_category(category), bonus, analysis.mapping, options
+                )
     with tabs[4]:
         render_export(result.raw_files[bonus_name], bonus, analysis, include_pending)
     with tabs[5]:

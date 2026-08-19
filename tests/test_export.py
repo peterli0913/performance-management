@@ -374,37 +374,151 @@ def test_interns_get_a_yellow_duty_cell(bonus_bytes, roster_bytes, bonus):
 
 
 def test_updates_rewrite_the_row_with_roster_values(bonus_bytes, bonus, result):
-    updates = [i for i in result.items if i.action == "update"]
-    assert len(updates) == 16
-    promoted = next(i for i in updates if i.key == ("胡强", "ALS10148"))
+    updates = result.by_action("update")
+    assert len(updates) == 1
     renamed = next(i for i in updates if i.key == ("曹静旺", "ALS14679"))
 
     data, summary = build_workbook(bonus_bytes, bonus, [], [], updates, mode="mark")
-    assert summary.updated == 16
+    assert summary.updated == 1
     sheet = openpyxl.load_workbook(io.BytesIO(data))[SHEET]
     # 没有插入也没有删除，行号保持原样
     assert sheet.max_row == 676
-    assert sheet.cell(promoted.frontline_row, 2).value == "车间副主任"
-    assert sheet.cell(promoted.frontline_row, 2).fill.fgColor.rgb == "FFFFC000"
-    # 没有差异的列不能被着色
-    assert sheet.cell(promoted.frontline_row, 3).fill.fgColor.rgb != "FFFFC000"
     assert sheet.cell(renamed.frontline_row, 3).value == "曹睿晟"
     assert sheet.cell(renamed.frontline_row, 3).fill.fgColor.rgb == "FFFFC000"
+    # 没有差异的列不能被着色
+    assert sheet.cell(renamed.frontline_row, 4).fill.fgColor.rgb != "FFFFC000"
 
     plain, _ = build_workbook(bonus_bytes, bonus, [], [], updates, mode="apply")
     sheet = openpyxl.load_workbook(io.BytesIO(plain))[SHEET]
-    assert sheet.cell(promoted.frontline_row, 2).value == "车间副主任"
-    assert sheet.cell(promoted.frontline_row, 2).fill.fgColor.rgb != "FFFFC000"
+    assert sheet.cell(renamed.frontline_row, 3).value == "曹睿晟"
+    assert sheet.cell(renamed.frontline_row, 3).fill.fgColor.rgb != "FFFFC000"
 
 
 def test_update_keeps_the_row_formulas_intact(bonus_bytes, bonus, result):
-    updates = [i for i in result.items if i.action == "update"]
+    updates = result.by_action("update")
     data, _ = build_workbook(bonus_bytes, bonus, [], [], updates, mode="apply")
     sheet = openpyxl.load_workbook(io.BytesIO(data), data_only=False)[SHEET]
     for item in updates:
         row = item.frontline_row
         assert sheet.cell(row, 6).value == f"=(K{row}+G{row}+H{row}+I{row}-J{row})"
         assert sheet.cell(row, 5).is_date or sheet.cell(row, 5).value is None
+
+
+OTHERS = "副主任&工艺组长及其他"
+
+
+def test_moves_leave_the_frontline_and_land_in_the_other_sheet(bonus_bytes, bonus, result):
+    moves = result.by_action("move")
+    assert len(moves) == 15
+    data, summary = build_workbook(bonus_bytes, bonus, [], [], [], moves, mode="apply")
+    assert summary.moved == 15
+    workbook = openpyxl.load_workbook(io.BytesIO(data))
+    frontline = workbook[SHEET]
+    others = workbook[OTHERS]
+    assert frontline.max_row == 676 - 15
+    assert others.max_row == 206 + 15
+
+    gone = {
+        (str(frontline.cell(r, 3).value or ""), str(frontline.cell(r, 4).value or ""))
+        for r in range(3, frontline.max_row + 1)
+    }
+    landed = {
+        (str(others.cell(r, 3).value or ""), str(others.cell(r, 4).value or ""))
+        for r in range(2, others.max_row + 1)
+    }
+    for item in moves:
+        assert (item.name, item.eid) not in gone, item.name
+        assert (str(item.new_values["姓名"]), str(item.new_values["员工编号"])) in landed, item.name
+
+
+def test_moved_rows_carry_workshop_duty_and_formulas(bonus_bytes, bonus, result):
+    moves = result.by_action("move")
+    data, _ = build_workbook(bonus_bytes, bonus, [], [], [], moves, mode="apply")
+    sheet = openpyxl.load_workbook(io.BytesIO(data), data_only=False)[OTHERS]
+    by_name = {}
+    for row in range(2, sheet.max_row + 1):
+        name = str(sheet.cell(row, 3).value or "")
+        if name:
+            by_name.setdefault(name, row)
+    for item in moves:
+        row = by_name[str(item.new_values["姓名"])]
+        # 这张表的车间列不合并，每行都要写车间名
+        assert str(sheet.cell(row, 1).value or "").strip() == item.target_workshop, item.name
+        assert str(sheet.cell(row, 2).value or "").strip() == item.new_values["职务"], item.name
+        assert sheet.cell(row, 5).is_date
+        # 该表的每行公式（F/G/H/J/L/R）要指向自己这一行
+        assert sheet.cell(row, 6).value == f"=(L{row}*K{row}+G{row}+H{row}+I{row}-J{row})"
+        assert f"D{row}" in sheet.cell(row, 18).value
+        assert "[1]生产部" in sheet.cell(row, 18).value
+
+
+def test_move_shifts_the_lookup_table_reference(bonus_bytes, bonus, result):
+    """副主任表 L 列的 HLOOKUP 引用第 143/144 行的档位参照表，插行后必须跟着顺延。"""
+    source = openpyxl.load_workbook(io.BytesIO(bonus_bytes), data_only=False)[OTHERS]
+    assert source["L2"].value == "=HLOOKUP(M2,$A$143:$H$144,2)"
+    moves = result.by_action("move")
+    data, _ = build_workbook(bonus_bytes, bonus, [], [], [], moves, mode="apply")
+    sheet = openpyxl.load_workbook(io.BytesIO(data), data_only=False)[OTHERS]
+    assert sheet["L2"].value == f"=HLOOKUP(M2,$A${143 + 15}:$H${144 + 15},2)"
+    assert sheet.cell(143 + 15, 1).value == source.cell(143, 1).value
+
+
+def test_moves_go_to_the_right_workshop_block(bonus_bytes, bonus, result):
+    moves = result.by_action("move")
+    data, summary = build_workbook(bonus_bytes, bonus, [], [], [], moves, mode="apply")
+    sheet = openpyxl.load_workbook(io.BytesIO(data))[OTHERS]
+    rows = []
+    for row in range(2, sheet.max_row + 1):
+        name = str(sheet.cell(row, 3).value or "")
+        if not name:
+            break
+        rows.append((row, str(sheet.cell(row, 1).value or "").strip(), name))
+    # 车间仍然成块，不能被打散
+    seen: list[str] = []
+    for _, workshop, _ in rows:
+        if not seen or seen[-1] != workshop:
+            assert workshop not in seen, f"车间 {workshop} 被拆成了多段"
+            seen.append(workshop)
+    # 副主任表原本没有的车间会追加在最后
+    assert set(summary.new_other_workshops) == {"清洗组", "DCS", "外围/罐区/泵房"}
+    assert seen[-3:] == ["DCS", "外围/罐区/泵房", "清洗组"]
+
+
+def test_marked_mode_flags_movers_red_in_the_frontline(bonus_bytes, bonus, result):
+    moves = result.by_action("move")
+    data, _ = build_workbook(bonus_bytes, bonus, [], [], [], moves, mode="mark")
+    workbook = openpyxl.load_workbook(io.BytesIO(data))
+    frontline = workbook[SHEET]
+    others = workbook[OTHERS]
+    assert frontline.max_row == 676, "标记版不删行"
+    for item in moves:
+        assert frontline.cell(item.frontline_row, 3).fill.fgColor.rgb == "FFFF0000"
+        assert frontline.cell(item.frontline_row, 4).fill.fgColor.rgb == "FFFF0000"
+    landed = [
+        row
+        for row in range(2, others.max_row + 1)
+        if str(others.cell(row, 3).value or "") in {str(i.new_values["姓名"]) for i in moves}
+    ]
+    assert len(landed) == len(moves)
+    for row in landed:
+        assert others.cell(row, 3).fill.fgColor.rgb == "FF92D050"
+
+
+def test_other_sheets_still_untouched_when_moving(bonus_bytes, bonus, result):
+    """改了两张子表，其余六张必须一字不动。"""
+    moves = result.by_action("move")
+    data, _ = build_workbook(bonus_bytes, bonus, [], [], [], moves, mode="apply")
+    before = openpyxl.load_workbook(io.BytesIO(bonus_bytes), data_only=False)
+    after = openpyxl.load_workbook(io.BytesIO(data), data_only=False)
+    assert before.sheetnames == after.sheetnames
+    for name in before.sheetnames:
+        if name in (SHEET, OTHERS):
+            continue
+        source, target = before[name], after[name]
+        assert source.max_row == target.max_row, name
+        for row in source.iter_rows():
+            for cell in row:
+                assert target[cell.coordinate].value == cell.value, (name, cell.coordinate)
 
 
 def _strip(key):

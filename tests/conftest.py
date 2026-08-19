@@ -44,6 +44,13 @@ def bonus(bonus_bytes):
 
 
 @pytest.fixture(scope="session")
+def roster_with_interns(roster_bytes):
+    from tj4tools.roster import parse_roster
+
+    return parse_roster(roster_bytes, ROSTER_FILE, include_interns=True)
+
+
+@pytest.fixture(scope="session")
 def result(roster, bonus):
     from tj4tools.roster import reconcile
 

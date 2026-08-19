@@ -27,12 +27,12 @@ def test_app_boots_and_analyzes_sample_files(app):
     assert {"两表一致", "新入职员工", "离职人员", "已在其他子表"} <= labels
     values = {metric.label: metric.value for metric in app.metric}
     assert values["两表一致"] == "616"
-    assert values["新入职员工"] == "252"
+    assert values["新入职员工"] == "249"
     assert values["离职人员"] == "41"
     assert values["待定·需核实"] == "16"
     assert values["已在其他子表"] == "59"
     assert "参照日期 2026-07-31" in text
-    assert "入职时间 ≥ 2026-06-30 的算新入职" in text
+    assert "入职时间在 2026-06-30 ~ 2026-07-31 之间的算新入职" in text
 
 
 def test_new_hire_window_is_a_date_input(app):
@@ -46,7 +46,7 @@ def test_new_hire_window_is_a_date_input(app):
 def test_interns_are_included_and_counted(app):
     intern_box = next(c for c in app.sidebar.checkbox if "纳入实习生" in c.label)
     assert intern_box.value is True
-    assert "43 人" in intern_box.label
+    assert "47 人" in intern_box.label
 
 
 def test_unmapped_groups_are_summarised_not_dumped(app):
@@ -85,7 +85,8 @@ def test_generate_marked_workbook_end_to_end(app):
     assert any("对照标记版" in d.label for d in downloads)
     success = " ".join(block.value for block in app.success)
     assert "标绿" in success and "标红" in success
-    assert "按清单更新 16 人" in success
+    assert "按清单更新 1 人" in success
+    assert "移到「副主任&工艺组长及其他」15 人" in success
     assert "实习生" in success
     # 23 名分组无法自动对应车间的人员应被跳过而不是硬塞进去
     assert "跳过 23 人" in success
@@ -103,14 +104,40 @@ def test_window_date_change_reruns_and_shifts_the_split(app):
     assert not app.exception
 
 
+def test_intern_classification_is_shown_and_configurable(app):
+    captions = " ".join(block.value for block in app.caption)
+    assert "实习生 46 人（按 2026-07-31 判断）" in captions
+    assert "入职超过3个月 1 人" in captions and "入职不到3个月 45 人" in captions
+    asof = next(w for w in app.sidebar.date_input if w.label == "实习生判断日期")
+    assert str(asof.value) == "2026-07-31"
+    asof.set_value(dt.date(2026, 12, 31)).run()
+    assert not app.exception, [e.value for e in app.exception]
+    captions = " ".join(block.value for block in app.caption)
+    assert "入职超过3个月 46 人" in captions
+    asof.set_value(dt.date(2026, 7, 31)).run()
+
+
+def test_pending_delete_tab_is_read_only_and_lists_actions(app):
+    text = " ".join(block.value for block in app.markdown) + " ".join(
+        block.value for block in app.info
+    )
+    assert "全部按人员清单的信息处理，无需复核" in text
+    assert "移到「副主任&工艺组长及其他」子表" in text
+    labels = {metric.label for metric in app.metric}
+    assert {"保留并更新", "移到副主任表"} <= labels
+    values = {metric.label: metric.value for metric in app.metric}
+    assert values["保留并更新"] == "1"
+    assert values["移到副主任表"] == "15"
+
+
 def test_turning_interns_off_shrinks_the_target_list(app):
     intern_box = next(c for c in app.sidebar.checkbox if "纳入实习生" in c.label)
     intern_box.set_value(False).run()
     assert not app.exception, [e.value for e in app.exception]
     values = {metric.label: metric.value for metric in app.metric}
-    assert values["新入职员工"] == "216"
+    assert values["新入职员工"] == "213"
     intern_box.set_value(True).run()
-    assert {m.label: m.value for m in app.metric}["新入职员工"] == "252"
+    assert {m.label: m.value for m in app.metric}["新入职员工"] == "249"
 
 
 def test_duty_field_switch_reruns_without_error(app):

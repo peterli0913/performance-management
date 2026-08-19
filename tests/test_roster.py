@@ -26,9 +26,9 @@ def test_roster_duty_field_switch(roster_bytes):
     from tj4tools.roster import parse_roster
 
     by_post = parse_roster(roster_bytes, "x，07-31-2026.xlsx", duty_field="岗位")
-    # 按「岗位」过滤时实习生仍被排除（默认 include_interns=False）
+    # 按「岗位」过滤时"职位写实习生"的人仍被排除（默认 include_interns=False）
     assert len(by_post.production) == 937
-    assert not any(p.is_intern for p in by_post.production.values())
+    assert not any(p.title == "实习生" for p in by_post.production.values())
 
 
 def test_interns_are_excluded_by_default_and_can_be_included(roster_bytes):
@@ -36,15 +36,29 @@ def test_interns_are_excluded_by_default_and_can_be_included(roster_bytes):
 
     default = parse_roster(roster_bytes, "x，07-31-2026.xlsx")
     assert len(default.production) == 935
-    assert not any(p.is_intern for p in default.production.values())
+    assert not any(p.title == "实习生" for p in default.production.values())
 
     with_interns = parse_roster(roster_bytes, "x，07-31-2026.xlsx", include_interns=True)
-    interns = [p for p in with_interns.production.values() if p.is_intern]
+    by_title = [p for p in with_interns.production.values() if p.intern_source == "职位"]
     assert len(with_interns.production) == 935 + 43
-    assert len(interns) == 43
+    assert len(by_title) == 43
     # 实习生的「职位」是实习生、「岗位」是实际岗位，纳入时按岗位归入职务分组
-    assert all(p.title == "实习生" for p in interns)
-    assert {p.duty for p in interns} == {"操作工"}
+    assert all(p.title == "实习生" for p in by_title)
+    assert {p.duty for p in by_title} == {"操作工"}
+
+
+def test_interns_can_also_be_detected_from_the_remark(roster_bytes):
+    """有的实习生职位和岗位都写实际岗位，只有备注里写着「校招实习生」。"""
+    from tj4tools.roster import parse_roster
+
+    roster = parse_roster(roster_bytes, "x，07-31-2026.xlsx")
+    by_remark = [p for p in roster.production_all.values() if p.intern_source == "备注"]
+    assert len(by_remark) == 4
+    assert all("实习" in p.remark for p in by_remark)
+    assert all(p.title != "实习生" for p in by_remark)
+    # 这些人的职位本来就是目标职务，所以不受「纳入实习生」开关影响
+    assert all(p.key in roster.production for p in by_remark)
+    assert {p.duty for p in by_remark} == {"助工", "操作工", "工程师"}
 
 
 def test_bonus_parsing_shape(bonus):
@@ -58,7 +72,8 @@ def test_bonus_parsing_shape(bonus):
     assert bonus.blocks[-1][2] == 675
     for previous, current in zip(bonus.blocks, bonus.blocks[1:]):
         assert current[1] == previous[2] + 1
-    assert len(bonus.others) == 139
+    # 只数到第 129 行的真实人员，不含第 130 行之后混排的参照表
+    assert len(bonus.others) == 128
 
 
 def test_merged_workshop_is_filled_down(bonus):
@@ -122,17 +137,51 @@ def test_new_hire_since_can_be_given_explicitly(roster, bonus):
 
 def test_pending_add_is_outside_window(result):
     for item in result.by_category(CATEGORY_PENDING_ADD):
-        if item.hire_date is not None:
-            assert item.hire_date < result.new_hire_since
+        if item.hire_date is not None and "人员变动说明" not in item.reason:
+            assert not (result.new_hire_since <= item.hire_date < result.ref_date)
 
 
-def test_hires_after_reference_date_still_count_as_new(result):
-    """窗口只有下界，晚于参照日期入职的人也是新入职（只是会被标出来）。"""
-    late = [i for i in result.items if i.hire_date and i.hire_date > result.ref_date]
-    assert late, "样本里应当有晚于参照日期入职的人"
+def test_hires_on_or_after_reference_date_are_pending_not_new(result):
+    """窗口有上界：入职时间不早于参照日期的算待定，并且要标出来。"""
+    late = [i for i in result.items if i.hire_date and i.hire_date >= result.ref_date]
+    assert late, "样本里应当有不早于参照日期入职的人"
     for item in late:
-        assert item.category == CATEGORY_NEW
-        assert any("晚于参照日期" in flag for flag in item.flags)
+        assert item.category == CATEGORY_PENDING_ADD, item
+        assert any("不早于参照日期" in flag for flag in item.flags)
+
+
+def test_intern_classification(roster_with_interns, bonus):
+    from tj4tools.roster import INTERN_JUNIOR, INTERN_SENIOR
+
+    analysis = reconcile(roster_with_interns, bonus)
+    interns = [i for i in analysis.items if i.is_intern]
+    assert interns
+    assert analysis.intern_asof == dt.date(2026, 7, 31)
+    assert analysis.intern_months == 3
+    cutoff = dt.date(2026, 4, 30)
+    for item in interns:
+        if item.intern_class == INTERN_SENIOR:
+            assert item.hire_date <= cutoff, item
+        elif item.intern_class == INTERN_JUNIOR:
+            assert cutoff < item.hire_date < analysis.intern_asof, item
+        assert any("实习生" in flag for flag in item.flags)
+    assert sum(analysis.intern_counts.values()) == len(interns)
+    # 判断日期往后推，原来"不到 3 个月"的会变成"超过 3 个月"
+    later = reconcile(roster_with_interns, bonus, intern_asof=dt.date(2026, 12, 31))
+    assert later.intern_counts[INTERN_SENIOR] > analysis.intern_counts[INTERN_SENIOR]
+
+
+def test_intern_classification_flags_impossible_dates(roster_with_interns, bonus):
+    """判断日期早于入职日期时算不出时长，单独归到"入职日期异常"而不是硬塞进某一类。"""
+    from tj4tools.roster import INTERN_JUNIOR, INTERN_UNKNOWN
+
+    early = reconcile(roster_with_interns, bonus, intern_asof=dt.date(2026, 5, 1))
+    assert early.intern_counts[INTERN_UNKNOWN] > 40
+    assert INTERN_JUNIOR not in early.intern_counts
+    for item in early.items:
+        if item.intern_class == INTERN_UNKNOWN:
+            assert item.hire_date is None or item.hire_date >= dt.date(2026, 5, 1)
+            assert any("无法计算入职时长" in flag for flag in item.flags)
 
 
 def test_left_people_have_evidence(result):
@@ -208,16 +257,60 @@ def test_add_items_carry_roster_rows_and_removes_carry_frontline_rows(result):
             assert item.frontline_row >= 3
 
 
-def test_pending_delete_becomes_an_update(result):
-    """核算有清单无的人都能在「生产部」里找到本人，所以是改信息而不是删人。"""
+def test_pending_delete_splits_into_keep_and_move(result):
+    """核算有清单无的人都能在「生产部」里找到本人：职务还是一线四种就保留，否则移到副主任表。"""
+    from tj4tools.roster import SHEET_OTHERS, is_target_duty
+
     items = result.by_category(CATEGORY_PENDING_DEL)
-    assert items
-    assert all(item.action == "update" for item in items)
-    assert all(item.updates for item in items)
+    assert len(items) == 16
+    assert all(item.action in ("update", "move") for item in items)
     assert all(item.roster_row >= 2 for item in items)
-    assert all("可按清单数据更新而不是删除" in item.reason for item in items)
+    for item in items:
+        new_duty = item.new_values["职务"]
+        if is_target_duty(new_duty):
+            assert item.action == "update", item
+            assert "保留" in item.action_text
+        else:
+            assert item.action == "move", item
+            assert item.target_sheet == SHEET_OTHERS
+            assert item.target_workshop, item
+    assert len(result.by_action("move")) == 15
+    assert len(result.by_action("update")) == 1
     # 离职人员仍然是删除
     assert all(item.action == "remove" for item in result.by_category(CATEGORY_LEFT))
+
+
+def test_move_targets_use_the_other_sheet_naming(result):
+    """两张子表的车间叫法不同，移动目标要用副主任表的叫法。"""
+    张睿尧 = next(i for i in result.by_action("move") if i.name == "张睿尧")
+    assert 张睿尧.workshop == "11号楼D级车间"  # 一线人员的叫法
+    assert 张睿尧.target_workshop == "11号楼车间D级区域"  # 副主任表的叫法
+    assert 张睿尧.target_workshop_source == "经验映射"
+
+    # 副主任表里没有清洗组，沿用一线车间名，导出时会新建
+    李硕 = next(i for i in result.by_action("move") if i.name == "李硕")
+    assert 李硕.target_workshop == "清洗组"
+    assert 李硕.target_workshop_source == "沿用一线车间"
+
+
+def test_others_sheet_layout_stops_before_the_reference_tables(bonus):
+    """副主任表第 130 行之后是混排在 A~D 列的参照表，不能当成人员。"""
+    layout = bonus.others_layout
+    assert layout is not None
+    assert layout.first_data_row == 2
+    assert layout.last_data_row == 129
+    assert len(layout.people) == 128
+    assert not layout.merged_workshop
+    assert layout.workshops[:2] == ["4号楼1&2车间", "4号楼3&4车间"]
+    assert layout.workshops[-1] == "安全组"
+    assert "产能利用率" not in layout.workshops
+    assert "A" not in layout.workshops
+    # 车间块首尾相接
+    for previous, current in zip(layout.blocks, layout.blocks[1:]):
+        assert current[1] == previous[2] + 1
+    assert layout.anchor_for("12号楼", "副主任")[1] == "职务"
+    assert layout.anchor_for("12号楼", "清洗工")[1] == "车间"
+    assert layout.anchor_for("清洗组", "清洗工") == (129, "表尾")
 
 
 def test_update_values_come_from_the_roster(result):
