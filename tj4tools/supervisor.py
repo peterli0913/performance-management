@@ -204,14 +204,11 @@ def reconcile_supervisors(
         )
 
     notes: list[str] = []
+    # 未映射车间只在 unmapped_groups 里给出数据，提示语交给界面按"当前生效的映射"实时算，
+    # 否则人工指定完映射后这里的固定文案还挂着，数字对不上。
     unmapped = Counter(
         item.group for item in items if item.action == ACTION_ADD and not item.workshop
     )
-    if unmapped:
-        notes.append(
-            f"有 {sum(unmapped.values())} 名待新增人员的分组在本表里没有对应车间，"
-            "请在下方「车间映射」里指定，否则导出时会被跳过。"
-        )
     scope_counts = Counter(groups[key] for key in target_keys)
     notes.append(
         f"取人口径：{scope}；目标共 {len(target_keys)} 人（"

@@ -136,9 +136,13 @@ def test_removes_explain_why_they_are_out_of_scope(strict):
 
 
 def test_unmapped_groups_are_reported(strict):
+    """只给出数据，提示语交给界面按"当前生效的映射"实时算，避免人工指定完文案还挂着。"""
     assert strict.unmapped_groups
     assert sum(count for _, count in strict.unmapped_groups) == 14
-    assert any("没有对应车间" in note for note in strict.notes)
+    assert not any("没有对应车间" in note for note in strict.notes)
+    unmapped = [i for i in strict.items if i.action == "add" and not i.workshop]
+    assert len(unmapped) == 14
+    assert all(any("没有对应车间" in flag for flag in i.flags) for i in unmapped)
 
 
 def test_literal_scope_pulls_in_the_frontline_backlog(roster_with_interns, bonus, placeable):

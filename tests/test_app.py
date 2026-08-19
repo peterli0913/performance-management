@@ -150,6 +150,44 @@ def test_duty_field_switch_reruns_without_error(app):
 FEATURE_SUPERVISOR = "② 副主任&工艺组长及其他"
 
 
+def _walk(node, out=None):
+    out = out if out is not None else []
+    out.append(node)
+    children = getattr(node, "children", None)
+    for child in children.values() if isinstance(children, dict) else (children or []):
+        _walk(child, out)
+    return out
+
+
+def _stray_elements(instance):
+    """找出被 Streamlit magic 意外渲染出来的原始对象。
+
+    回归：`st.info(x) if cond else st.warning(x)` 是个裸表达式，magic 会给它套一层
+    `st.write`，把 DeltaGenerator 的 repr 当正文打到页面上（用户看到的就是"一坨代码"）。
+    magic 能识别并跳过直接的 `st.xxx(...)` 调用，但识别不了条件表达式。
+    """
+    bad = []
+    for node in _walk(instance.main) + _walk(instance.sidebar):
+        if type(node).__name__ == "UnknownElement":
+            bad.append(repr(node)[:120])
+        for attr in ("value", "body"):
+            text = getattr(node, attr, None)
+            if isinstance(text, str) and ("DeltaGenerator" in text or "_provided_cursor" in text):
+                bad.append(f"{type(node).__name__}: {text[:120]}")
+    return bad
+
+
+def test_no_raw_objects_leak_into_the_page(app):
+    assert _stray_elements(app) == []
+
+
+def test_no_raw_objects_leak_into_the_supervisor_page():
+    instance = AppTest.from_file(APP, default_timeout=250).run()
+    instance.radio(key="feature").set_value(FEATURE_SUPERVISOR).run()
+    assert not instance.exception, [e.value for e in instance.exception]
+    assert _stray_elements(instance) == []
+
+
 @pytest.fixture(scope="module")
 def supervisor_app():
     instance = AppTest.from_file(APP, default_timeout=250).run()
@@ -173,28 +211,28 @@ def test_switching_to_the_supervisor_feature_works(supervisor_app):
     )
 
 
-def test_supervisor_scope_choice_is_explicit(supervisor_app):
-    from tj4tools.supervisor import SCOPE_STRICT
-
-    scope = supervisor_app.radio(key="sup_scope")
-    assert scope.value == SCOPE_STRICT, "默认应当是严格口径"
-    # 两种口径的目标人数要直接标在选项上，否则用户看不出选择的后果
-    labels = " ".join(str(option) for option in scope.options)
-    assert "目标 150 人" in labels
-    assert "目标 387 人" in labels
-
-
-def test_supervisor_literal_scope_warns_about_double_placement(supervisor_app):
-    from tj4tools.supervisor import SCOPE_LITERAL, SCOPE_STRICT
-
-    supervisor_app.radio(key="sup_scope").set_value(SCOPE_LITERAL).run()
-    assert not supervisor_app.exception, [e.value for e in supervisor_app.exception]
-    warnings = " ".join(block.value for block in supervisor_app.warning)
-    assert "同一个人会同时进两张子表" in warnings
+def test_supervisor_scope_is_fixed_to_strict(supervisor_app):
+    """口径不再让用户选：一律排除功能一能放进一线车间的人。"""
+    keys = [widget.label for widget in supervisor_app.radio]
+    assert "「不在一线清单里」怎么算" not in keys
+    with pytest.raises(KeyError):
+        supervisor_app.radio(key="sup_scope")
+    # 严格口径的目标是 150 人，本表现有 128 人
+    info = " ".join(block.value for block in supervisor_app.info)
+    assert "目标共 150 人" in info
+    assert "本表现有 128 人" in info
+    caption = " ".join(block.value for block in supervisor_app.caption)
+    assert "功能一能放进一线的那批人不会重复出现在这里" in caption
     values = {metric.label: metric.value for metric in supervisor_app.metric}
-    assert int(values["新入职员工"]) > 200
-    supervisor_app.radio(key="sup_scope").set_value(SCOPE_STRICT).run()
-    assert {m.label: m.value for m in supervisor_app.metric}["新入职员工"] == "20"
+    assert values["新入职员工"] == "20"
+
+
+def test_supervisor_unmapped_warning_is_live(supervisor_app):
+    """未映射车间的提示只出现一次，且由界面按当前映射实时计算。"""
+    warnings = [block.value for block in supervisor_app.warning]
+    live = [text for text in warnings if "没有对应车间" in text]
+    assert len(live) == 1, warnings
+    assert "还有 14 名待新增人员" in live[0]
 
 
 def test_supervisor_generates_and_offers_download(supervisor_app):

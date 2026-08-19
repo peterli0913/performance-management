@@ -31,12 +31,10 @@ from tj4tools.roster import (
     reconcile,
 )
 from tj4tools.supervisor import (
-    SCOPE_LITERAL,
-    SCOPES,
+    SCOPE_STRICT,
     build_duty_map,
     describe_duty_map,
     reconcile_supervisors,
-    target_summary,
 )
 from tj4tools.supervisor_export import build_supervisor_workbook
 from tj4tools.supervisor_export import split_by_action as sup_split_by_action
@@ -103,16 +101,6 @@ def _parsed_pair(roster_name, roster_bytes, bonus_name, bonus_bytes, duty_field,
         roster_bytes, roster_name, duty_field=duty_field, include_interns=include_interns
     )
     return roster, parse_bonus(bonus_bytes, bonus_name)
-
-
-@st.cache_data(show_spinner=False)
-def cached_supervisor_scopes(
-    roster_name, roster_bytes, bonus_name, bonus_bytes, duty_field, include_interns, placeable
-):
-    roster, bonus = _parsed_pair(
-        roster_name, roster_bytes, bonus_name, bonus_bytes, duty_field, include_interns
-    )
-    return target_summary(roster, bonus, set(placeable))
 
 
 @st.cache_data(show_spinner=False)
@@ -1037,7 +1025,8 @@ def render_supervisor_feature(payload, result, roster, bonus, frontline_analysis
     bonus_name = options_["bonus_name"]
     st.caption(
         "从人员清单生成「副主任&工艺组长及其他」子表：取**管理类职务**（车间副主任/工艺组长/经理），"
-        "外加**不在「一线人员」子表的**助工/工程师/操作工/班长。"
+        "外加**不在「一线人员」子表、且功能一也放不进一线车间的**助工/工程师/操作工/班长——"
+        "功能一能放进一线的那批人不会重复出现在这里。"
     )
     if bonus.others_layout is None:
         st.error("核算文件里找不到「副主任&工艺组长及其他」子表。")
@@ -1050,28 +1039,6 @@ def render_supervisor_feature(payload, result, roster, bonus, frontline_analysis
         if item.action == "add"
         and to_workshop(effective_workshop(Review(""), item, frontline_analysis.mapping))
     )
-    totals = cached_supervisor_scopes(
-        options_["roster_name"],
-        result.raw_files[options_["roster_name"]],
-        bonus_name,
-        result.raw_files[bonus_name],
-        options_["duty_field"],
-        options_["include_interns"],
-        placeable,
-    )
-    scope = st.radio(
-        "「不在一线清单里」怎么算",
-        SCOPES,
-        horizontal=False,
-        key="sup_scope",
-        format_func=lambda name: f"{name}　→ 目标 {totals.get(name, '?')} 人",
-        help="严格口径会排除功能一能放进一线车间的人，避免同一个人被放进两张子表。",
-    )
-    if scope == SCOPE_LITERAL:
-        st.warning(
-            f"字面口径的目标是 {totals.get(SCOPE_LITERAL)} 人，其中包含功能一要往「一线人员」"
-            "里新增的那批人——同一个人会同时进两张子表。确认这是你要的再继续。"
-        )
 
     try:
         analysis = cached_supervisor_analyze(
@@ -1084,7 +1051,7 @@ def render_supervisor_feature(payload, result, roster, bonus, frontline_analysis
             options_["ref_date"],
             options_["new_hire_since"],
             options_["intern_asof"],
-            scope,
+            SCOPE_STRICT,
             placeable,
         )
     except Exception as exc:  # noqa: BLE001 - 解析失败要给出可读原因
@@ -1098,8 +1065,13 @@ def render_supervisor_feature(payload, result, roster, bonus, frontline_analysis
     metrics[2].metric("待定·需新增", counts[CATEGORY_PENDING_ADD])
     metrics[3].metric("离职人员", counts[CATEGORY_LEFT])
     metrics[4].metric("待定·需核实", counts[CATEGORY_PENDING_DEL])
+    # 注意：这里必须写成 if/else 语句。写成条件表达式的话它是个裸表达式，
+    # Streamlit 的 magic 会给它套一层 st.write，把 DeltaGenerator 的 repr 打到页面上。
     for note in analysis.notes:
-        st.info(note) if note.startswith("取人口径") else st.warning(note)
+        if note.startswith("取人口径"):
+            st.info(note)
+        else:
+            st.warning(note)
 
     layout = bonus.others_layout
     duty_map = cached_supervisor_duty_map(
