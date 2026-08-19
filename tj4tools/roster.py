@@ -146,10 +146,16 @@ class SheetLayout:
     blocks: list[tuple[str, int, int]] = field(default_factory=list)
     duty_anchors: dict[tuple[str, str], int] = field(default_factory=dict)
     duty_order: dict[str, list[str]] = field(default_factory=dict)
+    # 规范化后的车间名 -> 单元格里的原始文本。匹配用规范化名，写回必须用原文，
+    # 否则「生产技术转移组（多肽）」会被写成半角括号，Excel 里就成了两个不同的车间。
+    raw_names: dict[str, str] = field(default_factory=dict)
 
     @property
     def workshops(self) -> list[str]:
         return [block[0] for block in self.blocks]
+
+    def raw_workshop(self, workshop: str) -> str:
+        return self.raw_names.get(workshop, workshop)
 
     def block_of(self, workshop: str) -> tuple[str, int, int] | None:
         for block in self.blocks:
@@ -587,7 +593,10 @@ def _parse_others(sheet) -> SheetLayout:
         name = norm_name(_get(row, indexes["name"]))
         if not name:
             break
-        workshop = clean_text(_get(row, indexes["workshop"]))
+        raw_workshop = _get(row, indexes["workshop"])
+        workshop = clean_text(raw_workshop)
+        if workshop:
+            layout.raw_names.setdefault(workshop, str(raw_workshop).strip())
         person = Person(
             name=name,
             eid=norm_eid(_get(row, indexes["eid"])),
@@ -927,6 +936,74 @@ def _attach_update(
     item.reason += f"，职务「{source.duty}」不属一线四种职务，移到「{SHEET_OTHERS}」"
 
 
+def new_hire_evidence(
+    person: Person,
+    roster: RosterFile,
+    new_hire_since: _dt.date | None,
+    anchor: _dt.date | None,
+) -> tuple[bool, list[str], list[str]]:
+    """判断"清单有、目标表无"的人算不算新入职，返回 (是否新入职, 依据, 提示)。
+
+    两个功能（一线人员 / 副主任&工艺组长及其他）共用同一套口径。
+    """
+    reasons: list[str] = []
+    flags: list[str] = []
+    change = roster.changes.get(person.key)
+    is_new = (
+        person.hire_date is not None
+        and new_hire_since is not None
+        and person.hire_date >= new_hire_since
+        and (anchor is None or person.hire_date < anchor)
+    )
+    if is_new:
+        reasons.append(f"入职 {person.hire_date} 落在 {new_hire_since} ~ {anchor} 之间")
+    if change is not None and change["leave_blank"]:
+        is_new = True
+        reasons.append(f"「{SHEET_CHANGES}」第 {change['row']} 行（{change['kind']}）且离职时间为空")
+    elif change is not None:
+        reasons.append(f"「{SHEET_CHANGES}」第 {change['row']} 行已有离职时间 {change['leave_raw']}")
+    if person.hire_date and anchor and person.hire_date >= anchor:
+        flags.append(f"入职时间 {person.hire_date} 不早于参照日期 {anchor}")
+    if not reasons:
+        reasons.append(
+            f"入职 {fmt_date(person.hire_date) or '未知'} 不在 {new_hire_since} ~ {anchor} 之间，"
+            f"且「{SHEET_CHANGES}」无在职记录"
+        )
+    return is_new, reasons, flags
+
+
+def departure_evidence(
+    key: tuple[str, str], roster: RosterFile
+) -> tuple[bool, list[str], Person | None, dict | None]:
+    """判断"目标表有、清单无"的人算不算离职，返回 (是否离职, 依据, 离职表记录, 变动说明记录)。"""
+    departure = roster.departures.get(key)
+    change = roster.changes.get(key)
+    reasons: list[str] = []
+    is_left = False
+    if departure is not None:
+        is_left = True
+        reasons.append(
+            f"「{SHEET_DEPARTURE}」第 {departure.row} 行"
+            + (
+                f"，离职时间 {fmt_date(departure.leave_date) or departure.leave_raw}"
+                if departure.leave_raw
+                else ""
+            )
+        )
+    if change is not None and not change["leave_blank"]:
+        is_left = True
+        reasons.append(f"「{SHEET_CHANGES}」第 {change['row']} 行有离职时间 {change['leave_raw']}")
+    elif change is not None:
+        reasons.append(f"「{SHEET_CHANGES}」第 {change['row']} 行（{change['kind']}）离职时间为空")
+    if not reasons:
+        reasons.append(f"「{SHEET_DEPARTURE}」与「{SHEET_CHANGES}」都查不到离职记录")
+    return is_left, reasons, departure, change
+
+
+def classify_intern(item: DiffItem, asof: _dt.date | None, months: int) -> None:
+    _classify_intern(item, asof, months)
+
+
 def _classify_intern(item: DiffItem, asof: _dt.date | None, months: int) -> None:
     """按判断日期把实习生分成"入职超过 N 个月"和"入职不到 N 个月"。"""
     if not item.is_intern:
@@ -1030,30 +1107,8 @@ def reconcile(
             if other != key:
                 flags.append(f"核算表有同名不同编号：{other[1]}")
 
-        change = roster.changes.get(key)
-        reasons: list[str] = []
-        is_new = False
-        in_window = (
-            person.hire_date is not None
-            and new_hire_since is not None
-            and person.hire_date >= new_hire_since
-            and (anchor is None or person.hire_date < anchor)
-        )
-        if in_window:
-            is_new = True
-            reasons.append(f"入职 {person.hire_date} 落在 {new_hire_since} ~ {anchor} 之间")
-        if change is not None and change["leave_blank"]:
-            is_new = True
-            reasons.append(f"「{SHEET_CHANGES}」第 {change['row']} 行（{change['kind']}）且离职时间为空")
-        elif change is not None:
-            reasons.append(f"「{SHEET_CHANGES}」第 {change['row']} 行已有离职时间 {change['leave_raw']}")
-        if person.hire_date and anchor and person.hire_date >= anchor:
-            flags.append(f"入职时间 {person.hire_date} 不早于参照日期 {anchor}")
-        if not reasons:
-            reasons.append(
-                f"入职 {fmt_date(person.hire_date) or '未知'} 不在 {new_hire_since} ~ {anchor} 之间，"
-                f"且「{SHEET_CHANGES}」无在职记录"
-            )
+        is_new, reasons, extra_flags = new_hire_evidence(person, roster, new_hire_since, anchor)
+        flags.extend(extra_flags)
         guess = mapping.get(person.group)
         item = DiffItem(
             key=key,
@@ -1080,22 +1135,7 @@ def reconcile(
     for key in sorted(bonus_keys - roster_keys, key=lambda k: bonus.frontline[k].row):
         person = bonus.frontline[key]
         flags = []
-        departure = roster.departures.get(key)
-        change = roster.changes.get(key)
-        reasons = []
-        is_left = False
-        if departure is not None:
-            is_left = True
-            reasons.append(
-                f"「{SHEET_DEPARTURE}」第 {departure.row} 行"
-                + (f"，离职时间 {fmt_date(departure.leave_date) or departure.leave_raw}" if departure.leave_raw else "")
-            )
-        if change is not None and not change["leave_blank"]:
-            is_left = True
-            reasons.append(f"「{SHEET_CHANGES}」第 {change['row']} 行有离职时间 {change['leave_raw']}")
-        elif change is not None:
-            reasons.append(f"「{SHEET_CHANGES}」第 {change['row']} 行（{change['kind']}）离职时间为空")
-
+        is_left, reasons, departure, change = departure_evidence(key, roster)
         still = roster.production_all.get(key)
         if still is not None:
             flags.append(f"仍在「{SHEET_PRODUCTION}」但职务为「{still.duty_raw}」（非目标职务）")
@@ -1107,8 +1147,6 @@ def reconcile(
         for other in name_to_roster.get(key[0], []):
             if other != key:
                 flags.append(f"清单有同名不同编号：{other[1]}")
-        if not reasons:
-            reasons.append(f"「{SHEET_DEPARTURE}」与「{SHEET_CHANGES}」都查不到离职记录")
 
         category = CATEGORY_LEFT if is_left else CATEGORY_PENDING_DEL
         item = DiffItem(

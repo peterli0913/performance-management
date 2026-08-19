@@ -236,24 +236,34 @@ def build_workbook(
     return editor.to_bytes(), summary
 
 
-def _insert_into_others(
-    editor: XlsxEditor, bonus: BonusFile, moves: list[DiffItem], mode: str, summary: ExportSummary
+def insert_into_layout(
+    editor: XlsxEditor,
+    layout,
+    items: list[DiffItem],
+    mode: str,
+    summary: ExportSummary,
+    *,
+    duty_of=None,
+    workshop_of=None,
+    deletes: set[int] | None = None,
+    highlights: list[Highlight] | None = None,
 ) -> None:
-    """把职务已经不属于一线四种职务的人插进「副主任&工艺组长及其他」。
+    """把人员插进一张"按车间分组、车间内按职务分段"的子表。
 
-    这张表的车间列**不合并**（每行都写车间名），所以不需要建合并区，
-    直接把车间当成普通一列写进去即可。
+    「副主任&工艺组长及其他」的车间列**不合并**（每行都写车间名），所以不建合并区，
+    直接把车间当成普通一列写进去。功能一的"移到该表"和功能二的"新增到该表"共用这里。
     """
-    layout = bonus.others_layout
-    if layout is None:
-        summary.warnings.append("核算文件里没有「副主任&工艺组长及其他」子表，移动动作已跳过")
-        return
     columns = layout.columns
+    duty_of = duty_of or (lambda item: str(item.new_values.get("职务") or item.duty))
+    workshop_of = workshop_of or (lambda item: item.target_workshop or item.workshop)
+
     buckets: dict[tuple[str, str], list[DiffItem]] = {}
-    for item in moves:
-        workshop = item.target_workshop or item.workshop
-        duty = str(item.new_values.get("职务") or item.duty)
-        buckets.setdefault((workshop, duty), []).append(item)
+    for item in items:
+        workshop = workshop_of(item)
+        if not workshop:
+            summary.skipped.append(f"{item.name}（{item.eid}）未指定车间，已跳过")
+            continue
+        buckets.setdefault((workshop, duty_of(item)), []).append(item)
 
     groups: list[InsertGroup] = []
     known = layout.workshops
@@ -267,21 +277,23 @@ def _insert_into_others(
         ),
     )
     for workshop, duty in ordered:
-        items = buckets[(workshop, duty)]
+        bucket = buckets[(workshop, duty)]
         anchor, precision = layout.anchor_for(workshop, duty)
         if precision == "表尾" and workshop not in summary.new_other_workshops:
             summary.new_other_workshops.append(workshop)
+        # 写回用单元格里的原始文本，避免全角/半角括号差异把车间块拆成两段
+        label = layout.raw_workshop(workshop)
         groups.append(
             InsertGroup(
                 anchor_row=anchor,
-                template_row=_pick_template(layout.first_data_row, anchor, set()),
+                template_row=_pick_template(layout.first_data_row, anchor, deletes or set()),
                 rows=[
-                    _new_row(item, columns, mode, workshop=workshop, duty=duty) for item in items
+                    _new_row(item, columns, mode, workshop=label, duty=duty) for item in bucket
                 ],
                 new_block=False,
             )
         )
-        summary.interns += sum(1 for item in items if item.is_intern)
+        summary.interns += sum(1 for item in bucket if item.is_intern)
     if summary.new_other_workshops:
         summary.warnings.append(
             f"「{layout.name}」里原本没有这些车间，相关人员已追加在该表人员区最下方："
@@ -289,9 +301,21 @@ def _insert_into_others(
         )
     editor.edit_rows(
         layout.name,
+        deletes=deletes or set(),
         inserts=groups,
+        highlights=highlights or [],
         first_data_row=layout.first_data_row,
     )
+
+
+def _insert_into_others(
+    editor: XlsxEditor, bonus: BonusFile, moves: list[DiffItem], mode: str, summary: ExportSummary
+) -> None:
+    layout = bonus.others_layout
+    if layout is None:
+        summary.warnings.append("核算文件里没有「副主任&工艺组长及其他」子表，移动动作已跳过")
+        return
+    insert_into_layout(editor, layout, moves, mode, summary)
 
 
 def _new_row(

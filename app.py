@@ -30,6 +30,16 @@ from tj4tools.roster import (
     parse_roster,
     reconcile,
 )
+from tj4tools.supervisor import (
+    SCOPE_LITERAL,
+    SCOPES,
+    build_duty_map,
+    describe_duty_map,
+    reconcile_supervisors,
+    target_summary,
+)
+from tj4tools.supervisor_export import build_supervisor_workbook
+from tj4tools.supervisor_export import split_by_action as sup_split_by_action
 
 NEW_BLOCK_PREFIX = "＋新建车间块："
 UNSET = "（未指定）"
@@ -88,6 +98,62 @@ def cached_analyze(
 
 
 @st.cache_data(show_spinner=False)
+def _parsed_pair(roster_name, roster_bytes, bonus_name, bonus_bytes, duty_field, include_interns):
+    roster = parse_roster(
+        roster_bytes, roster_name, duty_field=duty_field, include_interns=include_interns
+    )
+    return roster, parse_bonus(bonus_bytes, bonus_name)
+
+
+@st.cache_data(show_spinner=False)
+def cached_supervisor_scopes(
+    roster_name, roster_bytes, bonus_name, bonus_bytes, duty_field, include_interns, placeable
+):
+    roster, bonus = _parsed_pair(
+        roster_name, roster_bytes, bonus_name, bonus_bytes, duty_field, include_interns
+    )
+    return target_summary(roster, bonus, set(placeable))
+
+
+@st.cache_data(show_spinner=False)
+def cached_supervisor_duty_map(
+    roster_name, roster_bytes, bonus_name, bonus_bytes, duty_field, include_interns
+):
+    roster, bonus = _parsed_pair(
+        roster_name, roster_bytes, bonus_name, bonus_bytes, duty_field, include_interns
+    )
+    return build_duty_map(roster, bonus)
+
+
+@st.cache_data(show_spinner="正在对账「副主任&工艺组长及其他」…")
+def cached_supervisor_analyze(
+    roster_name,
+    roster_bytes,
+    bonus_name,
+    bonus_bytes,
+    duty_field,
+    include_interns,
+    ref_date,
+    new_hire_since,
+    intern_asof,
+    scope,
+    placeable,
+):
+    roster, bonus = _parsed_pair(
+        roster_name, roster_bytes, bonus_name, bonus_bytes, duty_field, include_interns
+    )
+    return reconcile_supervisors(
+        roster,
+        bonus,
+        ref_date=ref_date,
+        new_hire_since=new_hire_since,
+        intern_asof=intern_asof,
+        scope=scope,
+        placeable_keys=set(placeable),
+    )
+
+
+@st.cache_data(show_spinner=False)
 def count_interns(roster_bytes: bytes, roster_name: str) -> int:
     roster = parse_roster(roster_bytes, roster_name, duty_field="职位", include_interns=True)
     return sum(1 for person in roster.production.values() if person.is_intern)
@@ -103,24 +169,56 @@ def cached_db_bytes(payload: tuple[tuple[str, bytes], ...]) -> bytes:
 # --------------------------------------------------------------------------- #
 
 
-def init_state() -> None:
-    st.session_state.setdefault("decisions", {})
-    st.session_state.setdefault("workshop_override", {})
-    st.session_state.setdefault("mapping_override", {})
+STATE_KEYS = ("decisions", "workshop_override", "mapping_override")
 
 
-def decision_of(label: str) -> str:
-    return st.session_state["decisions"].get(label, UNDECIDED)
+class Review:
+    """一个功能的人工复核状态。
 
+    两个功能（一线人员 / 副主任&工艺组长及其他）会出现同一个人，
+    所以决策必须按功能分开存，否则在一个功能里点的"应用"会串到另一个功能。
+    """
 
-def set_decision(label: str, value: str) -> None:
-    st.session_state["decisions"][label] = value
+    def __init__(self, ns: str):
+        self.ns = ns
+        for name in STATE_KEYS:
+            st.session_state.setdefault(self.key(name), {})
 
+    def key(self, name: str) -> str:
+        return f"{self.ns}__{name}" if self.ns else name
 
-def bump(category: str) -> None:
-    """改变 data_editor 的 key，让批量操作后的表格重新初始化。"""
-    key = f"ver_{category}"
-    st.session_state[key] = st.session_state.get(key, 0) + 1
+    @property
+    def decisions(self) -> dict:
+        return st.session_state[self.key("decisions")]
+
+    @property
+    def workshop_override(self) -> dict:
+        return st.session_state[self.key("workshop_override")]
+
+    @property
+    def mapping_override(self) -> dict:
+        return st.session_state[self.key("mapping_override")]
+
+    def decision_of(self, label: str) -> str:
+        return self.decisions.get(label, UNDECIDED)
+
+    def set_decision(self, label: str, value: str) -> None:
+        self.decisions[label] = value
+
+    def reset(self) -> None:
+        for name in STATE_KEYS:
+            st.session_state[self.key(name)] = {}
+
+    def bump(self, category: str) -> None:
+        """改变 data_editor 的 key，让批量操作后的表格重新初始化。"""
+        key = self.key(f"ver_{category}")
+        st.session_state[key] = st.session_state.get(key, 0) + 1
+
+    def version(self, category: str) -> int:
+        return st.session_state.get(self.key(f"ver_{category}"), 0)
+
+    def widget(self, *parts) -> str:
+        return "_".join([self.ns or "main", *(str(p) for p in parts)])
 
 
 # --------------------------------------------------------------------------- #
@@ -189,51 +287,54 @@ def to_option(value: str, options: list[str]) -> str:
     return value if value in options else NEW_BLOCK_PREFIX + value
 
 
-def build_options(bonus, groups) -> list[str]:
+def build_options(workshops, groups) -> list[str]:
     """下拉选项 = 未指定 + 原有车间 + 「新建车间块」候选。"""
     return (
         [UNSET]
-        + list(bonus.workshops)
+        + list(workshops)
         + [NEW_BLOCK_PREFIX + name for name in sorted({g for g in groups if g})]
     )
 
 
-def effective_workshop(item, mapping) -> str:
-    person = st.session_state["workshop_override"]
-    group = st.session_state["mapping_override"]
-    if item.label in person:
-        return person[item.label]
-    if item.group in group:
-        return group[item.group]
+def effective_workshop(review: Review, item, mapping) -> str:
+    if item.label in review.workshop_override:
+        return review.workshop_override[item.label]
+    if item.group in review.mapping_override:
+        return review.mapping_override[item.group]
     guess = mapping.get(item.group)
-    return guess.workshop if guess else ""
+    if guess is not None:
+        return guess.workshop if hasattr(guess, "workshop") else str(guess)
+    return item.target_workshop or item.workshop
 
 
 def describe_guess(guess) -> str:
-    if guess is None or not guess.workshop:
+    if guess is None:
+        return "需人工指定"
+    if isinstance(guess, str):
+        return guess or "需人工指定"
+    if not guess.workshop:
         return "需人工指定"
     if guess.source == "经验":
         return f"{guess.workshop}（两表已匹配 {guess.support} 人 · 置信度{guess.confidence}）"
     return f"{guess.workshop}（按命名规则推断 · 置信度{guess.confidence}）"
 
 
-def render_mapping_editor(analysis, bonus, items, options) -> None:
+def render_mapping_editor(review: Review, mapping, items, options, hint: str) -> None:
     counts: dict[str, int] = {}
     for item in items:
         counts[item.group] = counts.get(item.group, 0) + 1
     if not counts:
         return
-    overrides = st.session_state["mapping_override"]
+    overrides = review.mapping_override
     rows = []
     for group, count in sorted(counts.items(), key=lambda kv: -kv[1]):
-        guess = analysis.mapping.get(group)
-        current = overrides.get(group, guess.workshop if guess else "")
+        guess = mapping.get(group)
         rows.append(
             {
                 "目前分组": group,
                 "待新增": count,
                 "自动建议": describe_guess(guess),
-                "最终车间": to_option(current, options),
+                "最终车间": to_option(effective_group_workshop(review, group, mapping), options),
             }
         )
     frame = pd.DataFrame(rows)
@@ -241,15 +342,12 @@ def render_mapping_editor(analysis, bonus, items, options) -> None:
     title = f"车间映射（{len(frame)} 个分组，"
     title += f"{unknown} 个待人工指定）" if unknown else "已全部对应）"
     with st.expander(title, expanded=bool(unknown)):
-        st.caption(
-            "「自动建议」由两表已匹配人员反推得出。置信度低或显示「需人工指定」的行请在右侧下拉里选择；"
-            "选「＋新建车间块」会在一线人员子表最下方新建该分组。"
-        )
+        st.caption(hint)
         edited = st.data_editor(
             frame,
             hide_index=True,
             width="stretch",
-            key="mapping_editor",
+            key=review.widget("mapping_editor"),
             column_config={
                 "目前分组": st.column_config.TextColumn(width="medium"),
                 "待新增": st.column_config.NumberColumn(width="small"),
@@ -263,6 +361,15 @@ def render_mapping_editor(analysis, bonus, items, options) -> None:
         for group, before, after in zip(frame["目前分组"], frame["最终车间"], edited["最终车间"]):
             if after != before:
                 overrides[group] = to_workshop(after)
+
+
+def effective_group_workshop(review: Review, group: str, mapping) -> str:
+    if group in review.mapping_override:
+        return review.mapping_override[group]
+    guess = mapping.get(group)
+    if guess is None:
+        return ""
+    return guess if isinstance(guess, str) else guess.workshop
 
 
 # --------------------------------------------------------------------------- #
@@ -342,12 +449,12 @@ def render_auto_applied(category, items) -> None:
         )
 
 
-def render_category(category, items, bonus, mapping, options) -> None:
+def render_category(review: Review, category, items, mapping, options, editable) -> None:
     if not items:
         st.success(f"没有「{category}」人员")
         return
 
-    decisions = st.session_state["decisions"]
+    decisions = review.decisions
     applied = sum(1 for item in items if decisions.get(item.label) == APPLY)
     cancelled = sum(1 for item in items if decisions.get(item.label) == CANCEL)
     metrics = st.columns([1, 1, 1, 1, 3])
@@ -358,52 +465,51 @@ def render_category(category, items, bonus, mapping, options) -> None:
 
     apply_label, cancel_label = choice_labels(category)
     bulk = st.columns([1, 1, 1, 5])
-    if bulk[0].button(f"全部{apply_label}", key=f"all_apply_{category}"):
+    if bulk[0].button(f"全部{apply_label}", key=review.widget("all_apply", category)):
         for item in items:
             decisions[item.label] = APPLY
-        bump(category)
+        review.bump(category)
         st.rerun()
-    if bulk[1].button(f"全部{cancel_label}", key=f"all_cancel_{category}"):
+    if bulk[1].button(f"全部{cancel_label}", key=review.widget("all_cancel", category)):
         for item in items:
             decisions[item.label] = CANCEL
-        bump(category)
+        review.bump(category)
         st.rerun()
-    if bulk[2].button("清空决策", key=f"all_reset_{category}"):
+    if bulk[2].button("清空决策", key=review.widget("all_reset", category)):
         for item in items:
             decisions.pop(item.label, None)
-        bump(category)
+        review.bump(category)
         st.rerun()
 
     mode = st.radio(
         "复核方式",
         ["表格批量", "逐条按钮"],
         horizontal=True,
-        key=f"mode_{category}",
+        key=review.widget("mode", category),
         help="人数多时用表格批量勾选更快；需要逐个确认时切到逐条按钮。",
     )
-    editable = category in ADD_CATEGORIES
     if mode == "表格批量":
-        render_table(category, items, mapping, options, editable)
+        render_table(review, category, items, mapping, options, editable)
     else:
-        render_rows(category, items, mapping, editable)
+        render_rows(review, category, items, mapping, editable)
 
 
-def row_payload(item, mapping, options=None) -> dict:
+def row_payload(review: Review, item, mapping, options=None) -> dict:
     payload = item.as_dict()
-    workshop = effective_workshop(item, mapping)
+    workshop = effective_workshop(review, item, mapping)
     payload["车间"] = to_option(workshop, options) if options else workshop
     return payload
 
 
-def render_table(category, items, mapping, options, editable) -> None:
+def render_table(review: Review, category, items, mapping, options, editable) -> None:
     """表格批量复核。
 
     「应用」和「取消」是两个独立复选框，并且无条件按编辑结果回写。
     这样表格状态与决策状态形成稳定不动点：既不会因为"没勾选"就把待定误判成取消，
     也不依赖"和上一帧比较"这种脆弱逻辑。
     """
-    decisions = st.session_state["decisions"]
-    overrides = st.session_state["workshop_override"]
+    decisions = review.decisions
+    overrides = review.workshop_override
     apply_label, cancel_label = choice_labels(category)
     order = ["应用", "取消", "姓名", "员工编号", "职务", "车间", "目前分组", "入职时间",
              "离职时间", "清单数据差异", "实习生", "离职/调出备注", "判定依据", "提示"]
@@ -412,7 +518,7 @@ def render_table(category, items, mapping, options, editable) -> None:
             {
                 "应用": decisions.get(item.label) == APPLY,
                 "取消": decisions.get(item.label) == CANCEL,
-                **{k: v for k, v in row_payload(item, mapping, options).items() if k in order},
+                **{k: v for k, v in row_payload(review, item, mapping, options).items() if k in order},
             }
             for item in items
         ]
@@ -442,13 +548,12 @@ def render_table(category, items, mapping, options, editable) -> None:
             options=options, required=True, width="medium"
         )
         disabled.remove("车间")
-    version = st.session_state.get(f"ver_{category}", 0)
     edited = st.data_editor(
         frame,
         hide_index=True,
         width="stretch",
         height=min(640, 90 + 35 * len(frame)),
-        key=f"editor_{category}_{version}",
+        key=review.widget("editor", category, review.version(category)),
         column_config=config,
         disabled=disabled,
     )
@@ -469,7 +574,7 @@ def render_table(category, items, mapping, options, editable) -> None:
     )
 
 
-def render_rows(category, items, mapping, editable) -> None:
+def render_rows(review: Review, category, items, mapping, editable) -> None:
     pages = max(1, (len(items) + PAGE_SIZE - 1) // PAGE_SIZE)
     page = 1
     if pages > 1:
@@ -479,7 +584,7 @@ def render_rows(category, items, mapping, editable) -> None:
                 min_value=1,
                 max_value=pages,
                 value=1,
-                key=f"page_{category}",
+                key=review.widget("page", category),
             )
         )
         first = (page - 1) * PAGE_SIZE + 1
@@ -487,7 +592,7 @@ def render_rows(category, items, mapping, editable) -> None:
     apply_label, cancel_label = choice_labels(category)
     badge = {APPLY: f"✅ {apply_label}", CANCEL: f"🚫 {cancel_label}", UNDECIDED: "⏳ 待定"}
     for item in items[(page - 1) * PAGE_SIZE : page * PAGE_SIZE]:
-        payload = row_payload(item, mapping)
+        payload = row_payload(review, item, mapping)
         cols = st.columns([2.2, 1.6, 0.9, 1.1, 1.1, 1.0, 1.0, 1.1])
         name = f"**{item.name}**　`{item.eid}`"
         cols[0].markdown(name + ("　🟡实习生" if item.is_intern else ""))
@@ -495,13 +600,13 @@ def render_rows(category, items, mapping, editable) -> None:
         cols[2].write(item.duty or "—")
         cols[3].write(payload["入职时间"] or "—")
         cols[4].write(payload["离职时间"] or "—")
-        if cols[5].button(apply_label, key=f"ok_{category}_{item.label}"):
-            set_decision(item.label, APPLY)
+        if cols[5].button(apply_label, key=review.widget("ok", category, item.label)):
+            review.set_decision(item.label, APPLY)
             st.rerun()
-        if cols[6].button(cancel_label, key=f"no_{category}_{item.label}"):
-            set_decision(item.label, CANCEL)
+        if cols[6].button(cancel_label, key=review.widget("no", category, item.label)):
+            review.set_decision(item.label, CANCEL)
             st.rerun()
-        cols[7].write(badge[decision_of(item.label)])
+        cols[7].write(badge[review.decision_of(item.label)])
         detail = payload["判定依据"]
         if payload["清单数据差异"]:
             detail = f"将改为：{payload['清单数据差异']}｜{detail}"
@@ -524,11 +629,11 @@ def output_name(bonus_name: str, suffix: str) -> str:
     return f"{base}（{suffix}{stamp}）.xlsx"
 
 
-def render_export(bonus_bytes, bonus, analysis, include_pending) -> None:
-    decisions = st.session_state["decisions"]
+def render_export(review: Review, bonus_bytes, bonus, analysis, include_pending) -> None:
+    decisions = review.decisions
 
     def resolved(item):
-        item.workshop = to_workshop(effective_workshop(item, analysis.mapping))
+        item.workshop = to_workshop(effective_workshop(review, item, analysis.mapping))
         return item
 
     selectable = [
@@ -553,9 +658,10 @@ def render_export(bonus_bytes, bonus, analysis, include_pending) -> None:
         )
         adds, removes, updates, moves = split_by_action(kept)
         preview_counts(adds, removes, updates, moves, "标记删除")
-        if st.button("生成对照标记版", type="primary", width="stretch"):
-            generate("mark", bonus_bytes, bonus, adds, removes, updates, moves)
-        offer_download("mark", bonus.file_name, "对照标记版")
+        if st.button("生成对照标记版", type="primary", width="stretch",
+                     key=review.widget("gen_mark")):
+            generate(review, "mark", bonus_bytes, bonus, adds, removes, updates, moves)
+        offer_download(review, "mark", bonus.file_name, "对照标记版")
 
     with right:
         st.subheader("② 已应用版")
@@ -565,9 +671,10 @@ def render_export(bonus_bytes, bonus, analysis, include_pending) -> None:
         )
         adds, removes, updates, moves = split_by_action(approved)
         preview_counts(adds, removes, updates, moves, "直接删除")
-        if st.button("生成已应用版", type="primary", width="stretch"):
-            generate("apply", bonus_bytes, bonus, adds, removes, updates, moves)
-        offer_download("apply", bonus.file_name, "已应用版")
+        if st.button("生成已应用版", type="primary", width="stretch",
+                     key=review.widget("gen_apply")):
+            generate(review, "apply", bonus_bytes, bonus, adds, removes, updates, moves)
+        offer_download(review, "apply", bonus.file_name, "已应用版")
 
     st.info(
         "两个导出都保留原文件的全部子表、字体、行高列宽、公式、筛选和条件格式；"
@@ -590,7 +697,7 @@ def preview_counts(adds, removes, updates, moves, remove_label: str) -> None:
         st.caption(f"另有 {pending} 人未指定车间，生成时会被跳过（在上方「车间映射」里指定即可纳入）")
 
 
-def generate(mode, bonus_bytes, bonus, adds, removes, updates=(), moves=()) -> None:
+def generate(review: Review, mode, bonus_bytes, bonus, adds, removes, updates=(), moves=()) -> None:
     if not adds and not removes and not updates and not moves:
         st.warning("没有需要处理的人员")
         return
@@ -602,12 +709,12 @@ def generate(mode, bonus_bytes, bonus, adds, removes, updates=(), moves=()) -> N
     except Exception as exc:  # noqa: BLE001 - 生成失败要给出可读原因
         st.error(f"生成失败：{type(exc).__name__}: {exc}")
         return
-    st.session_state[f"blob_{mode}"] = data
-    st.session_state[f"summary_{mode}"] = summary
+    st.session_state[review.key(f"blob_{mode}")] = data
+    st.session_state[review.key(f"summary_{mode}")] = summary
 
 
-def offer_download(mode, bonus_name, suffix) -> None:
-    summary = st.session_state.get(f"summary_{mode}")
+def offer_download(review: Review, mode, bonus_name, suffix) -> None:
+    summary = st.session_state.get(review.key(f"summary_{mode}"))
     if summary is None:
         return
     st.success(summary.text())
@@ -621,11 +728,11 @@ def offer_download(mode, bonus_name, suffix) -> None:
                 st.write("•", text)
     st.download_button(
         f"下载{suffix}",
-        data=st.session_state[f"blob_{mode}"],
+        data=st.session_state[review.key(f"blob_{mode}")],
         file_name=output_name(bonus_name, suffix),
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         width="stretch",
-        key=f"dl_{mode}",
+        key=review.widget("dl", mode),
     )
 
 
@@ -789,13 +896,12 @@ def render_sidebar(names, guess_roster, guess_bonus, intern_total):
     }
 
 
+FEATURE_FRONTLINE = "① 一线人员"
+FEATURE_SUPERVISOR = "② 副主任&工艺组长及其他"
+
+
 def main() -> None:
-    init_state()
-    st.title("📊 TJ4 安全质量奖人员对账")
-    st.caption(
-        "比对人员清单「生产部」里职务为助工/操作工/工程师/班长的人员与核算数据「一线人员」子表，"
-        "分出新入职、离职、两类待定，并生成保留原格式与公式的新核算表。"
-    )
+    st.title("📊 TJ4 安全质量奖核算表生成")
 
     payload = collect_uploads()
     if not payload:
@@ -820,14 +926,13 @@ def main() -> None:
     options_ = render_sidebar(names, guess_roster, guess_bonus, intern_total)
     roster_name = options_["roster_name"]
     bonus_name = options_["bonus_name"]
-    include_pending = options_["include_pending"]
 
     if roster_name == bonus_name:
         st.error("人员清单和核算数据不能是同一个文件，请在左侧重新选择。")
         return
 
     try:
-        _, bonus, analysis = cached_analyze(
+        roster, bonus, analysis = cached_analyze(
             roster_name,
             result.raw_files[roster_name],
             bonus_name,
@@ -843,6 +948,27 @@ def main() -> None:
         st.error(f"解析失败：{type(exc).__name__}: {exc}")
         return
 
+    feature = st.radio(
+        "要生成哪张子表",
+        [FEATURE_FRONTLINE, FEATURE_SUPERVISOR],
+        horizontal=True,
+        key="feature",
+        help="两张子表的取人口径不同，复核状态各自独立。",
+    )
+    if feature == FEATURE_SUPERVISOR:
+        render_supervisor_feature(payload, result, roster, bonus, analysis, options_)
+    else:
+        render_frontline_feature(payload, result, bonus, analysis, options_)
+
+
+def render_frontline_feature(payload, result, bonus, analysis, options_) -> None:
+    review = Review("")
+    bonus_name = options_["bonus_name"]
+    include_pending = options_["include_pending"]
+    st.caption(
+        "比对人员清单「生产部」里职务为助工/操作工/工程师/班长的人员与核算数据「一线人员」子表，"
+        "分出新入职、离职、两类待定，并生成保留原格式与公式的新核算表。"
+    )
     counts = analysis.counts
     metrics = st.columns(6)
     metrics[0].metric("两表一致", analysis.matched)
@@ -866,27 +992,16 @@ def main() -> None:
         st.warning(note)
 
     adds = [item for item in analysis.items if item.action == "add"]
-    options = build_options(bonus, {item.group for item in adds})
-    # 按当前生效的映射（含人工覆盖）实时统计，手工指定后这里的数字会立刻下降
-    pending: dict[str, int] = {}
-    for item in adds:
-        if not to_workshop(effective_workshop(item, analysis.mapping)):
-            pending[item.group] = pending.get(item.group, 0) + 1
-    if pending:
-        st.warning(
-            f"还有 {sum(pending.values())} 名待新增人员的分组没有对应车间，"
-            "请在下方「车间映射」里手工指定，否则导出时会被跳过。"
-        )
-        with st.expander(f"查看这 {len(pending)} 个待指定分组"):
-            st.dataframe(
-                pd.DataFrame(
-                    sorted(pending.items(), key=lambda kv: (-kv[1], kv[0])),
-                    columns=["目前分组", "待新增人数"],
-                ),
-                hide_index=True,
-                width="stretch",
-            )
-    render_mapping_editor(analysis, bonus, adds, options)
+    options = build_options(bonus.workshops, {item.group for item in adds})
+    render_unmapped_warning(review, adds, analysis.mapping)
+    render_mapping_editor(
+        review,
+        analysis.mapping,
+        adds,
+        options,
+        "「自动建议」由两表已匹配人员反推得出。置信度低或显示「需人工指定」的行请在右侧下拉里选择；"
+        "选「＋新建车间块」会在一线人员子表最下方新建该分组。",
+    )
 
     tabs = st.tabs(
         [
@@ -904,12 +1019,236 @@ def main() -> None:
                 render_auto_applied(category, analysis.by_category(category))
             else:
                 render_category(
-                    category, analysis.by_category(category), bonus, analysis.mapping, options
+                    review,
+                    category,
+                    analysis.by_category(category),
+                    analysis.mapping,
+                    options,
+                    category in ADD_CATEGORIES,
                 )
     with tabs[4]:
-        render_export(result.raw_files[bonus_name], bonus, analysis, include_pending)
+        render_export(review, result.raw_files[bonus_name], bonus, analysis, include_pending)
     with tabs[5]:
         render_database(payload, result)
+
+
+def render_supervisor_feature(payload, result, roster, bonus, frontline_analysis, options_) -> None:
+    review = Review("sup")
+    bonus_name = options_["bonus_name"]
+    st.caption(
+        "从人员清单生成「副主任&工艺组长及其他」子表：取**管理类职务**（车间副主任/工艺组长/经理），"
+        "外加**不在「一线人员」子表的**助工/工程师/操作工/班长。"
+    )
+    if bonus.others_layout is None:
+        st.error("核算文件里找不到「副主任&工艺组长及其他」子表。")
+        return
+
+    # 功能一能放进一线车间的人不该再进这张表，否则同一个人会出现在两张子表里
+    placeable = frozenset(
+        item.key
+        for item in frontline_analysis.items
+        if item.action == "add"
+        and to_workshop(effective_workshop(Review(""), item, frontline_analysis.mapping))
+    )
+    totals = cached_supervisor_scopes(
+        options_["roster_name"],
+        result.raw_files[options_["roster_name"]],
+        bonus_name,
+        result.raw_files[bonus_name],
+        options_["duty_field"],
+        options_["include_interns"],
+        placeable,
+    )
+    scope = st.radio(
+        "「不在一线清单里」怎么算",
+        SCOPES,
+        horizontal=False,
+        key="sup_scope",
+        format_func=lambda name: f"{name}　→ 目标 {totals.get(name, '?')} 人",
+        help="严格口径会排除功能一能放进一线车间的人，避免同一个人被放进两张子表。",
+    )
+    if scope == SCOPE_LITERAL:
+        st.warning(
+            f"字面口径的目标是 {totals.get(SCOPE_LITERAL)} 人，其中包含功能一要往「一线人员」"
+            "里新增的那批人——同一个人会同时进两张子表。确认这是你要的再继续。"
+        )
+
+    try:
+        analysis = cached_supervisor_analyze(
+            options_["roster_name"],
+            result.raw_files[options_["roster_name"]],
+            bonus_name,
+            result.raw_files[bonus_name],
+            options_["duty_field"],
+            options_["include_interns"],
+            options_["ref_date"],
+            options_["new_hire_since"],
+            options_["intern_asof"],
+            scope,
+            placeable,
+        )
+    except Exception as exc:  # noqa: BLE001 - 解析失败要给出可读原因
+        st.error(f"对账失败：{type(exc).__name__}: {exc}")
+        return
+
+    counts = analysis.counts
+    metrics = st.columns(5)
+    metrics[0].metric("已在本表", analysis.matched)
+    metrics[1].metric("新入职员工", counts[CATEGORY_NEW])
+    metrics[2].metric("待定·需新增", counts[CATEGORY_PENDING_ADD])
+    metrics[3].metric("离职人员", counts[CATEGORY_LEFT])
+    metrics[4].metric("待定·需核实", counts[CATEGORY_PENDING_DEL])
+    for note in analysis.notes:
+        st.info(note) if note.startswith("取人口径") else st.warning(note)
+
+    layout = bonus.others_layout
+    duty_map = cached_supervisor_duty_map(
+        options_["roster_name"],
+        result.raw_files[options_["roster_name"]],
+        bonus_name,
+        result.raw_files[bonus_name],
+        options_["duty_field"],
+        options_["include_interns"],
+    )
+    with st.expander(f"职务写法映射（{len(duty_map)} 条，由两表已匹配人员反推）"):
+        st.caption(
+            "清单写「车间副主任」，本表写「副主任」；清单写「助理工程师」，本表也写「助理工程师」。"
+            "映射由已匹配的人反推众数得出。"
+        )
+        st.dataframe(
+            pd.DataFrame(describe_duty_map(duty_map)), hide_index=True, width="stretch"
+        )
+
+    adds = [item for item in analysis.items if item.action == "add"]
+    workshop_mapping = {item.group: item.target_workshop for item in adds}
+    options = build_options(layout.workshops, {item.group for item in adds})
+    render_unmapped_warning(review, adds, workshop_mapping)
+    render_mapping_editor(
+        review,
+        workshop_mapping,
+        adds,
+        options,
+        "把清单的「目前分组」对应到本表的车间。本表的车间叫法和一线人员不同"
+        "（如「11号楼车间D级区域」）；选「＋新建车间块」会在本表人员区最下方新建。",
+    )
+
+    tabs = st.tabs(
+        [
+            f"新入职员工（{counts[CATEGORY_NEW]}）",
+            f"待定·清单有本表无（{counts[CATEGORY_PENDING_ADD]}）",
+            f"离职人员（{counts[CATEGORY_LEFT]}）",
+            f"待定·本表有清单无（{counts[CATEGORY_PENDING_DEL]}）",
+            "生成核算表",
+            "综合数据库",
+        ]
+    )
+    for tab, category in zip(tabs, CATEGORIES):
+        with tab:
+            render_category(
+                review,
+                category,
+                analysis.by_category(category),
+                workshop_mapping,
+                options,
+                category in ADD_CATEGORIES,
+            )
+    with tabs[4]:
+        render_supervisor_export(review, result.raw_files[bonus_name], bonus, analysis)
+    with tabs[5]:
+        render_database(payload, result)
+
+
+def render_supervisor_export(review: Review, bonus_bytes, bonus, analysis) -> None:
+    decisions = review.decisions
+    mapping = {
+        item.group: item.target_workshop for item in analysis.items if item.action == "add"
+    }
+
+    def resolved(item):
+        if item.action == "add":
+            item.target_workshop = to_workshop(effective_workshop(review, item, mapping))
+        return item
+
+    kept = [resolved(i) for i in analysis.items if decisions.get(i.label) != CANCEL]
+    approved = [resolved(i) for i in analysis.items if decisions.get(i.label) == APPLY]
+
+    left, right = st.columns(2)
+    with left:
+        st.subheader("① 对照标记版")
+        st.caption(
+            "新增人员插到本表对应车间**该职务**的最下方、姓名与员工编号填**绿色**；"
+            "需删除的人员保留原行、填**红色**。被点「取消」的人不纳入。"
+        )
+        adds, removes = sup_split(kept)
+        supervisor_preview(adds, removes, "标记删除")
+        if st.button("生成对照标记版", type="primary", width="stretch",
+                     key=review.widget("gen_mark")):
+            supervisor_generate(review, "mark", bonus_bytes, bonus, adds, removes)
+        offer_download(review, "mark", bonus.file_name, "副主任表·对照标记版")
+
+    with right:
+        st.subheader("② 已应用版")
+        st.caption("只处理被点「应用」的人：删除类**直接删行**、新增类**直接插入**且内容用**红色字体**。")
+        adds, removes = sup_split(approved)
+        supervisor_preview(adds, removes, "直接删除")
+        if st.button("生成已应用版", type="primary", width="stretch",
+                     key=review.widget("gen_apply")):
+            supervisor_generate(review, "apply", bonus_bytes, bonus, adds, removes)
+        offer_download(review, "apply", bonus.file_name, "副主任表·已应用版")
+
+    st.info(
+        "只改动「副主任&工艺组长及其他」子表的人员行，「一线人员」和其余子表一字不动；"
+        "格式、公式、筛选、条件格式全部保留，实习生的职务列填**黄色**底纹。"
+    )
+
+
+def sup_split(items):
+    return sup_split_by_action(items)
+
+
+def supervisor_preview(adds, removes, remove_label: str) -> None:
+    ready = [item for item in adds if item.target_workshop]
+    pending = len(adds) - len(ready)
+    st.write(f"将新增 **{len(ready)}** 人，{remove_label} **{len(removes)}** 人")
+    if pending:
+        st.caption(f"另有 {pending} 人未指定车间，生成时会被跳过（在上方「车间映射」里指定即可纳入）")
+
+
+def supervisor_generate(review: Review, mode, bonus_bytes, bonus, adds, removes) -> None:
+    if not adds and not removes:
+        st.warning("没有需要处理的人员")
+        return
+    try:
+        with st.spinner("正在生成 Excel…"):
+            data, summary = build_supervisor_workbook(bonus_bytes, bonus, adds, removes, mode=mode)
+    except Exception as exc:  # noqa: BLE001 - 生成失败要给出可读原因
+        st.error(f"生成失败：{type(exc).__name__}: {exc}")
+        return
+    st.session_state[review.key(f"blob_{mode}")] = data
+    st.session_state[review.key(f"summary_{mode}")] = summary
+
+
+def render_unmapped_warning(review: Review, adds, mapping) -> None:
+    """按当前生效的映射（含人工覆盖）实时统计，手工指定后这里的数字会立刻下降。"""
+    pending: dict[str, int] = {}
+    for item in adds:
+        if not to_workshop(effective_workshop(review, item, mapping)):
+            pending[item.group] = pending.get(item.group, 0) + 1
+    if not pending:
+        return
+    st.warning(
+        f"还有 {sum(pending.values())} 名待新增人员的分组没有对应车间，"
+        "请在下方「车间映射」里手工指定，否则导出时会被跳过。"
+    )
+    with st.expander(f"查看这 {len(pending)} 个待指定分组"):
+        st.dataframe(
+            pd.DataFrame(
+                sorted(pending.items(), key=lambda kv: (-kv[1], kv[0])),
+                columns=["目前分组", "待新增人数"],
+            ),
+            hide_index=True,
+            width="stretch",
+        )
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ def test_app_boots_and_analyzes_sample_files(app):
     text = " ".join(block.value for block in app.markdown) + " ".join(
         block.value for block in app.caption
     )
-    assert "TJ4 安全质量奖人员对账" in app.title[0].value
+    assert "TJ4 安全质量奖核算表生成" in app.title[0].value
     labels = {metric.label for metric in app.metric}
     assert {"两表一致", "新入职员工", "离职人员", "已在其他子表"} <= labels
     values = {metric.label: metric.value for metric in app.metric}
@@ -147,6 +147,78 @@ def test_duty_field_switch_reruns_without_error(app):
     assert not app.exception
 
 
+FEATURE_SUPERVISOR = "② 副主任&工艺组长及其他"
+
+
+@pytest.fixture(scope="module")
+def supervisor_app():
+    instance = AppTest.from_file(APP, default_timeout=250).run()
+    assert not instance.exception, [e.value for e in instance.exception]
+    instance.radio(key="feature").set_value(FEATURE_SUPERVISOR).run()
+    assert not instance.exception, [e.value for e in instance.exception]
+    return instance
+
+
+def test_switching_to_the_supervisor_feature_works(supervisor_app):
+    values = {metric.label: metric.value for metric in supervisor_app.metric}
+    assert values["已在本表"] == "117"
+    assert values["新入职员工"] == "20"
+    assert values["待定·需新增"] == "13"
+    assert values["离职人员"] == "6"
+    assert values["待定·需核实"] == "5"
+    text = " ".join(block.value for block in supervisor_app.caption)
+    assert "副主任&工艺组长及其他" in text
+    assert "管理类职务" in text or "管理类职务" in " ".join(
+        block.value for block in supervisor_app.info
+    )
+
+
+def test_supervisor_scope_choice_is_explicit(supervisor_app):
+    from tj4tools.supervisor import SCOPE_STRICT
+
+    scope = supervisor_app.radio(key="sup_scope")
+    assert scope.value == SCOPE_STRICT, "默认应当是严格口径"
+    # 两种口径的目标人数要直接标在选项上，否则用户看不出选择的后果
+    labels = " ".join(str(option) for option in scope.options)
+    assert "目标 150 人" in labels
+    assert "目标 387 人" in labels
+
+
+def test_supervisor_literal_scope_warns_about_double_placement(supervisor_app):
+    from tj4tools.supervisor import SCOPE_LITERAL, SCOPE_STRICT
+
+    supervisor_app.radio(key="sup_scope").set_value(SCOPE_LITERAL).run()
+    assert not supervisor_app.exception, [e.value for e in supervisor_app.exception]
+    warnings = " ".join(block.value for block in supervisor_app.warning)
+    assert "同一个人会同时进两张子表" in warnings
+    values = {metric.label: metric.value for metric in supervisor_app.metric}
+    assert int(values["新入职员工"]) > 200
+    supervisor_app.radio(key="sup_scope").set_value(SCOPE_STRICT).run()
+    assert {m.label: m.value for m in supervisor_app.metric}["新入职员工"] == "20"
+
+
+def test_supervisor_generates_and_offers_download(supervisor_app):
+    button = next(b for b in supervisor_app.button if b.label == "生成对照标记版")
+    button.click().run()
+    assert not supervisor_app.exception, [e.value for e in supervisor_app.exception]
+    success = " ".join(block.value for block in supervisor_app.success)
+    assert "新增" in success and "标记删除 11 人" in success
+    labels = [d.label for d in supervisor_app.get("download_button")]
+    assert any("副主任表·对照标记版" in label for label in labels)
+
+
+def test_two_features_keep_separate_decisions():
+    """同一个人可能出现在两个功能里，决策不能串。"""
+    instance = AppTest.from_file(APP, default_timeout=250).run()
+    _tick(instance, "main_editor_新入职员工_0", [0])
+    assert len(instance.session_state["decisions"]) == 1
+    instance.radio(key="feature").set_value(FEATURE_SUPERVISOR).run()
+    assert not instance.exception, [e.value for e in instance.exception]
+    # 功能二有自己的命名空间，功能一的决策不会漏过去
+    assert instance.session_state["sup__decisions"] == {}
+    assert len(instance.session_state["decisions"]) == 1
+
+
 def _tick(instance, key, rows, column="应用"):
     """模拟在 data_editor 里勾选若干行。"""
     instance.session_state[key] = {
@@ -160,7 +232,7 @@ def _tick(instance, key, rows, column="应用"):
 def test_table_checkboxes_survive_reruns_and_reach_the_export():
     """回归：勾选「应用」后切页签、点其他按钮，决策不能丢。"""
     instance = AppTest.from_file(APP, default_timeout=200).run()
-    key = "editor_新入职员工_0"
+    key = "main_editor_新入职员工_0"
     _tick(instance, key, [0, 1, 2])
     assert instance.session_state["decisions"], "勾选应当写进决策状态"
     assert list(instance.session_state["decisions"].values()) == ["应用"] * 3
@@ -192,7 +264,7 @@ def test_unticked_rows_stay_undecided():
 
 def test_cancel_column_removes_person_from_both_exports():
     instance = AppTest.from_file(APP, default_timeout=200).run()
-    _tick(instance, "editor_新入职员工_0", [0, 1], column="取消")
+    _tick(instance, "main_editor_新入职员工_0", [0, 1], column="取消")
     assert list(instance.session_state["decisions"].values()) == ["取消"] * 2
     next(b for b in instance.button if b.label == "生成对照标记版").click().run()
     messages = [block.value for block in instance.success]
@@ -209,6 +281,6 @@ def test_preview_counts_match_generated_counts():
     next(b for b in instance.button if b.label == "生成对照标记版").click().run()
     assert any("新增 279 人" in block.value for block in instance.success)
 
-    _tick(instance, "editor_新入职员工_0", [0], column="取消")
+    _tick(instance, "main_editor_新入职员工_0", [0], column="取消")
     markdown = " ".join(block.value for block in instance.markdown)
     assert "将新增 **278** 人" in markdown
