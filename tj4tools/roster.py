@@ -123,6 +123,9 @@ class Person:
     leave_raw: str = ""
     row: int = 0
     workshop: str = ""
+    post: str = ""  # 清单的「岗位」列
+    title: str = ""  # 清单的「职位」列
+    is_intern: bool = False
 
     @property
     def key(self) -> tuple[str, str]:
@@ -157,6 +160,8 @@ class BonusFile:
     last_data_row: int = 3
     columns: dict[str, str] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
+    duty_anchors: dict[tuple[str, str], int] = field(default_factory=dict)
+    duty_order: dict[str, list[str]] = field(default_factory=dict)
 
     def block_of(self, workshop: str) -> tuple[str, int, int] | None:
         for block in self.blocks:
@@ -168,13 +173,29 @@ class BonusFile:
     def workshops(self) -> list[str]:
         return [block[0] for block in self.blocks]
 
+    def anchor_for(self, workshop: str, duty: str) -> tuple[int | None, bool]:
+        """返回 (插入锚点行, 是否按职务精确定位)。
+
+        锚点是该车间块里这个职务最下面的一行；该车间没有这个职务时退回块末尾。
+        """
+        anchor = self.duty_anchors.get((workshop, canon_duty(duty)))
+        if anchor is not None:
+            return anchor, True
+        block = self.block_of(workshop)
+        return (block[2] if block else None), False
+
 
 # --------------------------------------------------------------------------- #
 # 人员清单解析
 # --------------------------------------------------------------------------- #
 
 
-def parse_roster(data: bytes, file_name: str, duty_field: str = "职位") -> RosterFile:
+def parse_roster(
+    data: bytes,
+    file_name: str,
+    duty_field: str = "职位",
+    include_interns: bool = False,
+) -> RosterFile:
     import openpyxl
 
     workbook = openpyxl.load_workbook(io.BytesIO(data), data_only=True)
@@ -183,11 +204,13 @@ def parse_roster(data: bytes, file_name: str, duty_field: str = "职位") -> Ros
         production = find_sheet(workbook, SHEET_PRODUCTION)
         if production is None:
             raise ValueError(f"{file_name} 里找不到「{SHEET_PRODUCTION}」子表")
-        result.production_all, result.production = _parse_staff_sheet(production, duty_field)
+        result.production_all, result.production = _parse_staff_sheet(
+            production, duty_field, include_interns
+        )
 
         equipment = find_sheet(workbook, SHEET_EQUIPMENT)
         if equipment is not None:
-            result.equipment = _parse_staff_sheet(equipment, duty_field)[0]
+            result.equipment = _parse_staff_sheet(equipment, duty_field, include_interns)[0]
 
         departure = find_sheet(workbook, SHEET_DEPARTURE)
         if departure is None:
@@ -221,30 +244,44 @@ def _staff_header(sheet):
     }
 
 
-def _parse_staff_sheet(sheet, duty_field: str):
-    """返回 (全部人员, 目标职务人员)。"""
+INTERN_TITLE = "实习生"
+
+
+def _parse_staff_sheet(sheet, duty_field: str, include_interns: bool = False):
+    """返回 (全部人员, 目标职务人员)。
+
+    实习生的「职位」记作实习生、「岗位」记作实际岗位（示例文件里全是操作工）。
+    按「职位」过滤时实习生天然被排除；``include_interns`` 打开后改用他们的岗位，
+    这样实习生也能进目标名单，并在导出时用黄色底纹标出来。
+    """
     _, cols = _staff_header(sheet)
     everyone: dict[tuple[str, str], Person] = {}
     targets: dict[tuple[str, str], Person] = {}
-    duty_index = cols["title"] if duty_field == "职位" else cols["post"]
     for offset, row in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=2):
         name = norm_name(_get(row, cols["name"]))
         if not name:
             continue
-        eid = norm_eid(_get(row, cols["eid"]))
-        duty_raw = clean_text(_get(row, duty_index))
+        post = clean_text(_get(row, cols["post"]))
+        title = clean_text(_get(row, cols["title"]))
+        is_intern = title == INTERN_TITLE
+        duty_raw = title if duty_field == "职位" else post
+        if is_intern and include_interns and not is_target_duty(duty_raw):
+            duty_raw = post
         person = Person(
             name=name,
-            eid=eid,
+            eid=norm_eid(_get(row, cols["eid"])),
             duty=canon_duty(duty_raw),
             duty_raw=duty_raw,
             group=clean_text(_get(row, cols["group"])),
             hire_date=parse_date(_get(row, cols["hire"])),
             remark=clean_text(_get(row, cols["remark"])),
             row=offset,
+            post=post,
+            title=title,
+            is_intern=is_intern,
         )
         everyone[person.key] = person
-        if is_target_duty(duty_raw):
+        if is_target_duty(duty_raw) and (include_interns or not is_intern):
             targets[person.key] = person
     return everyone, targets
 
@@ -431,6 +468,46 @@ def _parse_frontline(sheet, result: BonusFile) -> None:
         result.last_data_row = row
 
     result.blocks = [(name, spans[name][0], spans[name][1]) for name in order]
+    _build_duty_anchors(result)
+
+
+def _build_duty_anchors(result: BonusFile) -> None:
+    """算出每个车间块里每种职务的插入锚点。
+
+    同一职务在一个车间里可能被别的职务隔成几段（示例文件里 11号楼D级车间 的助工
+    就被操作工隔成 51 人和 1 人两段），这时取**人数最多**的那一段的末行，
+    新人才会跟主群体待在一起，而不是被甩到块尾。
+    """
+    for workshop, start, end in result.blocks:
+        rows = [
+            result.frontline[key]
+            for key in result.frontline_order
+            if start <= result.frontline[key].row <= end
+        ]
+        runs: list[tuple[str, int, int]] = []  # (职务, 起始行, 末行)
+        for person in rows:
+            if runs and runs[-1][0] == person.duty and runs[-1][2] == person.row - 1:
+                runs[-1] = (person.duty, runs[-1][1], person.row)
+            else:
+                runs.append((person.duty, person.row, person.row))
+        best: dict[str, tuple[int, int]] = {}
+        for duty, run_start, run_end in runs:
+            size = run_end - run_start + 1
+            if duty not in best or size > best[duty][0]:
+                best[duty] = (size, run_end)
+        for duty, (_, run_end) in best.items():
+            result.duty_anchors[(workshop, duty)] = run_end
+        seen = []
+        for duty, _, _ in runs:
+            if duty not in seen:
+                seen.append(duty)
+        result.duty_order[workshop] = seen
+        split = [d for d in seen if sum(1 for r in runs if r[0] == d) > 1]
+        if split:
+            result.notes.append(
+                f"「{workshop}」里 {'、'.join(split)} 被其他职务隔成多段，"
+                "新增人员会插到人数最多的那一段末尾"
+            )
 
 
 def _parse_others(sheet) -> dict[tuple[str, str], Person]:
@@ -566,6 +643,15 @@ def _rule_workshop(group: str, workshops: set[str], mapping: dict[str, WorkshopG
 # --------------------------------------------------------------------------- #
 
 
+ACTION_ADD = "add"
+ACTION_REMOVE = "remove"
+ACTION_UPDATE = "update"
+
+# 「待定·核算有清单无」如果能在清单里找到同一个人，改的就是信息而不是删人；
+# 这几个字段会按清单值覆盖核算表里的原行。
+UPDATE_FIELDS = ("姓名", "员工编号", "职务", "入职日期")
+
+
 @dataclass
 class DiffItem:
     key: tuple[str, str]
@@ -584,14 +670,18 @@ class DiffItem:
     flags: list[str] = field(default_factory=list)
     frontline_row: int = 0
     roster_row: int = 0
+    is_intern: bool = False
+    action: str = ACTION_ADD
+    updates: dict[str, tuple[str, str]] = field(default_factory=dict)
+    new_values: dict[str, object] = field(default_factory=dict)
 
     @property
     def label(self) -> str:
         return key_label(self.key)
 
     @property
-    def action(self) -> str:
-        return "add" if self.category in ADD_CATEGORIES else "remove"
+    def update_text(self) -> str:
+        return "；".join(f"{name} {old or '空'}→{new or '空'}" for name, (old, new) in self.updates.items())
 
     def as_dict(self) -> dict:
         return {
@@ -604,6 +694,8 @@ class DiffItem:
             "入职时间": fmt_date(self.hire_date),
             "离职时间": fmt_date(self.leave_date) or self.leave_raw,
             "离职/调出备注": self.departure_remark,
+            "清单数据差异": self.update_text,
+            "实习生": "是" if self.is_intern else "",
             "判定依据": self.reason,
             "提示": "；".join(self.flags),
             "_key": self.label,
@@ -614,12 +706,13 @@ class DiffItem:
 class Reconciliation:
     items: list[DiffItem]
     ref_date: _dt.date | None
-    window_start: _dt.date | None
+    new_hire_since: _dt.date | None
     mapping: dict[str, WorkshopGuess]
     matched: int = 0
     only_roster: int = 0
     only_bonus: int = 0
     excluded_in_others: int = 0
+    paired_renames: int = 0
     notes: list[str] = field(default_factory=list)
     unmapped_groups: list[tuple[str, int]] = field(default_factory=list)
 
@@ -639,17 +732,58 @@ class Reconciliation:
         return None
 
 
+def _match_in_roster(key, roster: RosterFile, by_eid, by_name) -> Person | None:
+    """在整张「生产部」里找同一个人：先精确，再编号唯一，最后姓名唯一。"""
+    exact = roster.production_all.get(key)
+    if exact is not None:
+        return exact
+    candidates = by_eid.get(key[1], [])
+    if len(candidates) == 1:
+        return candidates[0]
+    candidates = by_name.get(key[0], [])
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def _attach_update(item: DiffItem, current: Person, source: Person) -> None:
+    """把"按清单数据更新"所需的新值与差异说明挂到 item 上。"""
+    pairs = (
+        ("姓名", current.name, source.name),
+        ("员工编号", current.eid, source.eid),
+        ("职务", current.duty, source.duty),
+        ("入职日期", fmt_date(current.hire_date), fmt_date(source.hire_date)),
+    )
+    item.new_values = {
+        "姓名": source.name,
+        "员工编号": source.eid,
+        "职务": source.duty,
+        "入职日期": source.hire_date,
+    }
+    item.updates = {name: (old, new) for name, old, new in pairs if old != new}
+    item.is_intern = source.is_intern
+    item.action = ACTION_UPDATE
+    item.roster_row = source.row
+    item.reason += (
+        f"；「{SHEET_PRODUCTION}」第 {source.row} 行有同一人"
+        f"（{source.name} {source.eid} 职位「{source.title or source.duty_raw}」），"
+        "可按清单数据更新而不是删除"
+    )
+
+
 def reconcile(
     roster: RosterFile,
     bonus: BonusFile,
     *,
     ref_date: _dt.date | None = None,
-    window_months: int = 1,
+    new_hire_since: _dt.date | None = None,
     exclude_in_others: bool = True,
     mapping: dict[str, WorkshopGuess] | None = None,
 ) -> Reconciliation:
+    """``new_hire_since``：入职时间不早于该日期的算新入职；默认为参照日期前一个月。"""
     anchor = ref_date or roster.ref_date
-    window_start = months_before(anchor, window_months) if anchor else None
+    if new_hire_since is None:
+        new_hire_since = months_before(anchor, 1) if anchor else None
     mapping = mapping or build_workshop_mapping(roster, bonus)
 
     roster_keys = set(roster.production)
@@ -666,6 +800,14 @@ def reconcile(
     for key in roster_keys:
         eid_to_roster[key[1]].append(key)
         name_to_roster[key[0]].append(key)
+
+    # 找"同一个人"要在整张生产部表里找，而不是只在目标职务里找——
+    # 职务变动（班长→工艺组长）恰恰是这类差异最常见的成因
+    eid_to_roster_all = defaultdict(list)
+    name_to_roster_all = defaultdict(list)
+    for key, person in roster.production_all.items():
+        eid_to_roster_all[key[1]].append(person)
+        name_to_roster_all[key[0]].append(person)
 
     items: list[DiffItem] = []
     excluded = 0
@@ -689,19 +831,21 @@ def reconcile(
         change = roster.changes.get(key)
         reasons: list[str] = []
         is_new = False
-        if person.hire_date and window_start and window_start <= person.hire_date <= anchor:
+        if person.hire_date and new_hire_since and person.hire_date >= new_hire_since:
             is_new = True
-            reasons.append(f"入职 {person.hire_date} 在 {window_start}~{anchor} 内")
-        elif person.hire_date and anchor and person.hire_date > anchor:
-            flags.append(f"入职时间 {person.hire_date} 晚于参照日期 {anchor}")
+            reasons.append(f"入职 {person.hire_date} 不早于窗口日期 {new_hire_since}")
         if change is not None and change["leave_blank"]:
             is_new = True
             reasons.append(f"「{SHEET_CHANGES}」第 {change['row']} 行（{change['kind']}）且离职时间为空")
         elif change is not None:
             reasons.append(f"「{SHEET_CHANGES}」第 {change['row']} 行已有离职时间 {change['leave_raw']}")
+        if person.hire_date and anchor and person.hire_date > anchor:
+            flags.append(f"入职时间 {person.hire_date} 晚于参照日期 {anchor}")
+        if person.is_intern:
+            flags.append("实习生")
         if not reasons:
             reasons.append(
-                f"入职 {fmt_date(person.hire_date) or '未知'} 不在近 {window_months} 个月内，"
+                f"入职 {fmt_date(person.hire_date) or '未知'} 早于窗口日期 {new_hire_since}，"
                 f"且「{SHEET_CHANGES}」无在职记录"
             )
         guess = mapping.get(person.group)
@@ -720,6 +864,8 @@ def reconcile(
                 reason="；".join(reasons),
                 flags=flags,
                 roster_row=person.row,
+                is_intern=person.is_intern,
+                action=ACTION_ADD,
             )
         )
 
@@ -757,27 +903,58 @@ def reconcile(
         if not reasons:
             reasons.append(f"「{SHEET_DEPARTURE}」与「{SHEET_CHANGES}」都查不到离职记录")
 
-        items.append(
-            DiffItem(
-                key=key,
-                name=person.name,
-                eid=person.eid,
-                category=CATEGORY_LEFT if is_left else CATEGORY_PENDING_DEL,
-                duty=person.duty,
-                duty_raw=person.duty_raw,
-                group=departure.group if departure else (still.group if still else ""),
-                workshop=person.workshop,
-                hire_date=person.hire_date,
-                leave_date=departure.leave_date if departure else (change["leave_date"] if change else None),
-                leave_raw=departure.leave_raw if departure else (change["leave_raw"] if change else ""),
-                departure_remark=departure.remark if departure else (change["remark"] if change else ""),
-                reason="；".join(reasons),
-                flags=flags,
-                frontline_row=person.row,
-            )
+        category = CATEGORY_LEFT if is_left else CATEGORY_PENDING_DEL
+        item = DiffItem(
+            key=key,
+            name=person.name,
+            eid=person.eid,
+            category=category,
+            duty=person.duty,
+            duty_raw=person.duty_raw,
+            group=departure.group if departure else (still.group if still else ""),
+            workshop=person.workshop,
+            hire_date=person.hire_date,
+            leave_date=departure.leave_date if departure else (change["leave_date"] if change else None),
+            leave_raw=departure.leave_raw if departure else (change["leave_raw"] if change else ""),
+            departure_remark=departure.remark if departure else (change["remark"] if change else ""),
+            reason="；".join(reasons),
+            flags=flags,
+            frontline_row=person.row,
+            action=ACTION_REMOVE,
         )
+        if category == CATEGORY_PENDING_DEL:
+            # 这类人多半没离职，只是职务变了或姓名录错；能在清单里找到本人就改成"更新信息"
+            source = _match_in_roster(key, roster, eid_to_roster_all, name_to_roster_all)
+            if source is not None:
+                _attach_update(item, person, source)
+        items.append(item)
+
+    # 同一个人可能同时落在两边：清单里叫「曹睿晟」、核算表里叫「曹静旺」（同一个员工编号）。
+    # 更新那一侧改完名字就等于这个人已经在表里了，新增那一侧必须撤掉，否则会出现重复行。
+    rename_targets = {
+        (item.new_values.get("姓名"), item.new_values.get("员工编号")): item
+        for item in items
+        if item.action == ACTION_UPDATE
+    }
+    paired = 0
+    kept_items = []
+    for item in items:
+        target = rename_targets.get(item.key) if item.action == ACTION_ADD else None
+        if target is not None and target is not item:
+            target.flags.append(
+                f"与「{SHEET_PRODUCTION}」第 {item.roster_row} 行是同一人，"
+                "按清单改名即可，不需要另外新增"
+            )
+            paired += 1
+            continue
+        kept_items.append(item)
+    items = kept_items
 
     notes = list(roster.notes) + list(bonus.notes)
+    if paired:
+        notes.append(
+            f"有 {paired} 人在两表里编号相同、姓名不同，已合并为「按清单更新姓名」，不再重复新增"
+        )
     pending = Counter(
         item.group
         for item in items
@@ -788,12 +965,13 @@ def reconcile(
     return Reconciliation(
         items=items,
         ref_date=anchor,
-        window_start=window_start,
+        new_hire_since=new_hire_since,
         mapping=mapping,
         matched=len(matched),
         only_roster=len(roster_keys - bonus_keys),
         only_bonus=len(bonus_keys - roster_keys),
         excluded_in_others=excluded,
+        paired_renames=paired,
         notes=notes,
         unmapped_groups=unmapped,
     )

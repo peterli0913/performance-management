@@ -17,8 +17,11 @@ Q = lambda tag: f"{{{MAIN_NS}}}{tag}"  # noqa: E731
 def generated(bonus_bytes, bonus, result):
     adds = [i for i in result.items if i.action == "add" and i.workshop]
     removes = [i for i in result.items if i.action == "remove"]
-    mark, _ = build_workbook(bonus_bytes, bonus, adds, removes, mode="mark")
-    apply_, _ = build_workbook(bonus_bytes, bonus, adds[:20], removes[:10], mode="apply")
+    updates = [i for i in result.items if i.action == "update"]
+    mark, _ = build_workbook(bonus_bytes, bonus, adds, removes, updates, mode="mark")
+    apply_, _ = build_workbook(
+        bonus_bytes, bonus, adds[:20], removes[:10], updates[:5], mode="apply"
+    )
     return {"mark": mark, "apply": apply_}
 
 
@@ -107,13 +110,15 @@ def test_styles_only_grow(bonus_bytes, generated, mode):
     before = zipfile.ZipFile(io.BytesIO(bonus_bytes)).read("xl/styles.xml").decode()
     after = zipfile.ZipFile(io.BytesIO(generated[mode])).read("xl/styles.xml").decode()
     counts = lambda text, tag: int(re.search(rf"<{tag} count=\"(\d+)\"", text).group(1))  # noqa: E731
-    for tag in ("fonts", "borders", "dxfs", "cellStyleXfs"):
+    # 这几张表不能动：dxfs 被条件格式按索引引用，动了就串色
+    for tag in ("borders", "dxfs", "cellStyleXfs"):
         assert counts(before, tag) == counts(after, tag), tag
-    assert counts(after, "cellXfs") >= counts(before, "cellXfs")
-    assert counts(after, "fills") >= counts(before, "fills")
+    # 填充色、字体（红字）、cellXfs 只允许追加
+    for tag in ("cellXfs", "fills", "fonts"):
+        assert counts(after, tag) >= counts(before, tag), tag
     # 声明的 count 必须和实际元素数一致
     root = ET.fromstring(after.encode())
-    for tag in ("fills", "cellXfs"):
+    for tag in ("fills", "fonts", "cellXfs"):
         element = root.find(Q(tag))
         assert int(element.get("count")) == len(list(element))
 

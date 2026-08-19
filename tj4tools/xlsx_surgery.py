@@ -32,6 +32,9 @@ EXCEL_MAX_ROW = 1048576
 
 FILL_GREEN = "FF92D050"
 FILL_RED = "FFFF0000"
+FILL_YELLOW = "FFFFFF00"
+FILL_ORANGE = "FFFFC000"
+FONT_RED = "FFFF0000"
 
 _XMLNS_RE = re.compile(r'xmlns(?::(?P<prefix>[\w.-]+))?="(?P<uri>[^"]+)"')
 
@@ -84,6 +87,7 @@ class NewRow:
 
     values: dict[str, object] = field(default_factory=dict)
     fills: dict[str, str] = field(default_factory=dict)
+    font_colors: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -104,11 +108,13 @@ class InsertGroup:
 
 @dataclass
 class Highlight:
-    """给已有行的若干单元格加填充色。"""
+    """给已有行的若干单元格改样式；``value`` 非 None 时同时改写内容。"""
 
     row: int
     cols: list[str]
-    color: str
+    color: str | None = None
+    font_color: str | None = None
+    values: dict[str, object] = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #
@@ -389,17 +395,20 @@ def _q(tag: str) -> str:
 
 
 class StyleTable:
-    """按需向 styles.xml 追加填充色与 cellXfs 条目。"""
+    """按需向 styles.xml 追加填充色、字体与 cellXfs 条目。"""
 
     def __init__(self, data: bytes):
         self.root, self._decl, self._root_tag = _parse_part(data)
         self._fills = self.root.find(_q("fills"))
+        self._fonts = self.root.find(_q("fonts"))
         self._cell_xfs = self.root.find(_q("cellXfs"))
-        if self._fills is None or self._cell_xfs is None:
-            raise ValueError("styles.xml 缺少 fills/cellXfs")
+        if self._fills is None or self._cell_xfs is None or self._fonts is None:
+            raise ValueError("styles.xml 缺少 fills/fonts/cellXfs")
         self._xfs = list(self._cell_xfs)
+        self._font_list = list(self._fonts)
         self._fill_cache: dict[str, int] = {}
-        self._xf_cache: dict[tuple[int, int], int] = {}
+        self._font_cache: dict[tuple[int, str], int] = {}
+        self._xf_cache: dict[tuple[int, int | None, int | None], int] = {}
         self.dirty = False
         for index, fill in enumerate(self._fills):
             pattern = fill.find(_q("patternFill"))
@@ -409,6 +418,30 @@ class StyleTable:
             rgb = fg.get("rgb") if fg is not None else None
             if rgb and rgb.upper() not in self._fill_cache:
                 self._fill_cache[rgb.upper()] = index
+
+    def font_id(self, base_font: int, argb: str) -> int:
+        """复制 base_font 并只改颜色，字号/字体名/加粗全部沿用原样。"""
+        argb = argb.upper()
+        key = (base_font, argb)
+        if key in self._font_cache:
+            return self._font_cache[key]
+        if 0 <= base_font < len(self._font_list):
+            font = copy.deepcopy(self._font_list[base_font])
+        else:
+            font = ET.Element(_q("font"))
+        for existing in font.findall(_q("color")):
+            font.remove(existing)
+        color = ET.Element(_q("color"))
+        color.set("rgb", argb)
+        # <color> 在 CT_Font 里的位置比较靠前，插在 <sz>/<name> 之前更贴近 Excel 的写法
+        font.insert(0, color)
+        self._fonts.append(font)
+        self._font_list.append(font)
+        index = len(self._font_list) - 1
+        self._fonts.set("count", str(index + 1))
+        self._font_cache[key] = index
+        self.dirty = True
+        return index
 
     def fill_id(self, argb: str) -> int:
         argb = argb.upper()
@@ -425,10 +458,16 @@ class StyleTable:
         self.dirty = True
         return index
 
-    def styled(self, base_xf: int, argb: str) -> int:
-        """返回"基于 base_xf、填充色为 argb"的 cellXfs 索引。"""
-        fill = self.fill_id(argb)
-        key = (base_xf, fill)
+    def styled(self, base_xf: int, argb: str | None = None, font_color: str | None = None) -> int:
+        """返回"基于 base_xf、叠加填充色 / 字体色"的 cellXfs 索引。"""
+        if argb is None and font_color is None:
+            return base_xf
+        fill = self.fill_id(argb) if argb else None
+        base_font = 0
+        if 0 <= base_xf < len(self._xfs):
+            base_font = int(self._xfs[base_xf].get("fontId") or 0)
+        font = self.font_id(base_font, font_color) if font_color else None
+        key = (base_xf, fill, font)
         if key in self._xf_cache:
             return self._xf_cache[key]
         if 0 <= base_xf < len(self._xfs):
@@ -439,8 +478,12 @@ class StyleTable:
             new_xf.set("fontId", "0")
             new_xf.set("borderId", "0")
             new_xf.set("xfId", "0")
-        new_xf.set("fillId", str(fill))
-        new_xf.set("applyFill", "1")
+        if fill is not None:
+            new_xf.set("fillId", str(fill))
+            new_xf.set("applyFill", "1")
+        if font is not None:
+            new_xf.set("fontId", str(font))
+            new_xf.set("applyFont", "1")
         self._cell_xfs.append(new_xf)
         self._xfs.append(new_xf)
         index = len(self._xfs) - 1
@@ -543,6 +586,7 @@ class XlsxEditor:
 
         shared = self._collect_shared_formulas(sheet_data)
         self._expand_shared_formulas(sheet_data, shared)
+        per_row_cols, donors = self._profile_formulas(sheet_data, first_data_row)
 
         # 模板行必须在重编号之前快照，否则复制到的是已经改过行号的公式
         templates = {}
@@ -582,7 +626,14 @@ class XlsxEditor:
             created: list[ET.Element] = []
             for spec, new_row in zip(group.rows, slots):
                 element = self._build_row(
-                    template, group.template_row, new_row, rowmap, sheet_name, spec
+                    template,
+                    group.template_row,
+                    new_row,
+                    rowmap,
+                    sheet_name,
+                    spec,
+                    per_row_cols,
+                    donors,
                 )
                 sheet_data.append(element)
                 created.append(element)
@@ -645,6 +696,40 @@ class XlsxEditor:
                 for attr in ("t", "si", "ref"):
                     formula.attrib.pop(attr, None)
 
+    # -- 公式画像 ---------------------------------------------------------- #
+
+    def _profile_formulas(
+        self, sheet_data: ET.Element, first_data_row: int, threshold: float = 0.5
+    ) -> tuple[set[str], dict[str, tuple[int, str]]]:
+        """区分"每行都有的人员公式"和"整块统计公式"，并为每列挑一个健康的样板。
+
+        新行只应该继承前者：像 ``COUNTIF($L$3:$AP$73,"a")`` 这种按车间块统计的公式
+        只出现在少数行上，复制到新行会凭空多出一份统计。
+
+        样板还用来修 ``#REF!``：源文件里可能残留 ``SUMIF(...,#REF!,...)``（有人删过行），
+        照抄会把坏公式扩散到新增人员身上。
+        """
+        rows = [
+            row
+            for row in sheet_data.findall(_q("row"))
+            if int(row.get("r")) >= first_data_row
+        ]
+        counts: dict[str, int] = {}
+        donors: dict[str, tuple[int, str]] = {}
+        for row in rows:
+            row_index = int(row.get("r"))
+            for cell in row.findall(_q("c")):
+                formula = cell.find(_q("f"))
+                if formula is None or not formula.text:
+                    continue
+                col = split_coord(cell.get("r"))[0]
+                counts[col] = counts.get(col, 0) + 1
+                if col not in donors and "#REF!" not in formula.text:
+                    donors[col] = (row_index, formula.text)
+        limit = max(1, int(len(rows) * threshold))
+        per_row = {col for col, count in counts.items() if count >= limit}
+        return per_row, donors
+
     # -- 行/单元格构造 ------------------------------------------------------ #
 
     def _renumber_row(
@@ -666,6 +751,8 @@ class XlsxEditor:
         rowmap: RowMap,
         sheet_name: str,
         spec: NewRow,
+        per_row_cols: set[str] | None = None,
+        donors: dict[str, tuple[int, str]] | None = None,
     ) -> ET.Element:
         element = copy.deepcopy(template)
         element.set("r", str(new_row))
@@ -676,18 +763,39 @@ class XlsxEditor:
             cell.set("r", f"{col}{new_row}")
             formula = cell.find(_q("f"))
             if formula is not None and formula.text:
-                formula.text = remap_formula(formula.text, local, sheet_name)
+                if per_row_cols is not None and col not in per_row_cols:
+                    # 整块统计公式不属于单个人，不能跟着新行复制
+                    self._clear_cell(cell)
+                    continue
+                text = formula.text
+                source = local
+                if "#REF!" in text and donors and col in donors:
+                    donor_row, text = donors[col]
+                    source = _LocalRowMap(rowmap, donor_row, new_row)
+                    self._note_repair(sheet_name, template_row, col)
+                formula.text = remap_formula(text, source, sheet_name)
                 self._clear_cached_value(cell)
             else:
                 self._clear_cell(cell)
         for col, value in spec.values.items():
             cell = self._ensure_cell(element, col, new_row, template)
             self._set_cell_value(cell, value)
-        for col, argb in spec.fills.items():
+        for col in set(spec.fills) | set(spec.font_colors):
             cell = self._ensure_cell(element, col, new_row, template)
             base = int(cell.get("s") or 0)
-            cell.set("s", str(self.styles.styled(base, argb)))
+            cell.set(
+                "s",
+                str(self.styles.styled(base, spec.fills.get(col), spec.font_colors.get(col))),
+            )
         return element
+
+    def _note_repair(self, sheet_name: str, template_row: int, col: str) -> None:
+        message = (
+            f"「{sheet_name}」第 {template_row} 行的 {col} 列公式含 #REF!（源文件里就是坏的），"
+            "新增行已改用同列正常公式；建议顺手修一下原表这一格"
+        )
+        if message not in self.warnings:
+            self.warnings.append(message)
 
     @staticmethod
     def _clear_cached_value(cell: ET.Element) -> None:
@@ -723,13 +831,7 @@ class XlsxEditor:
         source = self._find_cell(template, col)
         if source is not None and source.get("s"):
             cell.set("s", source.get("s"))
-        target = col_to_index(col)
-        position = len(row)
-        for index, other in enumerate(row.findall(_q("c"))):
-            if col_to_index(split_coord(other.get("r"))[0]) > target:
-                position = index
-                break
-        row.insert(position, cell)
+        self._insert_cell_in_order(row, cell, col)
         return cell
 
     @staticmethod
@@ -758,14 +860,26 @@ class XlsxEditor:
         text_el.text = text
 
     def _apply_highlight(self, row: ET.Element, row_index: int, item: Highlight) -> None:
-        for col in item.cols:
+        for col in set(item.cols) | set(item.values):
             cell = self._find_cell(row, col)
             if cell is None:
                 cell = ET.Element(_q("c"))
                 cell.set("r", f"{col}{row_index}")
-                row.append(cell)
-            base = int(cell.get("s") or 0)
-            cell.set("s", str(self.styles.styled(base, item.color)))
+                self._insert_cell_in_order(row, cell, col)
+            if col in item.values:
+                self._set_cell_value(cell, item.values[col])  # 样式索引 s 会被保留
+            if col in item.cols and (item.color or item.font_color):
+                base = int(cell.get("s") or 0)
+                cell.set("s", str(self.styles.styled(base, item.color, item.font_color)))
+
+    @staticmethod
+    def _insert_cell_in_order(row: ET.Element, cell: ET.Element, col: str) -> None:
+        target = col_to_index(col)
+        for index, other in enumerate(row.findall(_q("c"))):
+            if col_to_index(split_coord(other.get("r"))[0]) > target:
+                row.insert(index, cell)
+                return
+        row.append(cell)
 
     # -- 工作表其余元素 ---------------------------------------------------- #
 

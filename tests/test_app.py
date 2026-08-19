@@ -1,5 +1,6 @@
 """用 Streamlit 的 AppTest 做端到端冒烟测试：不起浏览器、不截图，直接断言。"""
 
+import datetime as dt
 import os
 
 import pytest
@@ -26,17 +27,38 @@ def test_app_boots_and_analyzes_sample_files(app):
     assert {"两表一致", "新入职员工", "离职人员", "已在其他子表"} <= labels
     values = {metric.label: metric.value for metric in app.metric}
     assert values["两表一致"] == "616"
-    assert values["新入职员工"] == "213"
+    assert values["新入职员工"] == "252"
     assert values["离职人员"] == "41"
+    assert values["待定·需核实"] == "16"
     assert values["已在其他子表"] == "59"
     assert "参照日期 2026-07-31" in text
+    assert "入职时间 ≥ 2026-06-30 的算新入职" in text
+
+
+def test_new_hire_window_is_a_date_input(app):
+    labels = [widget.label for widget in app.sidebar.date_input]
+    assert "新入职判定窗口日期" in labels
+    assert not [w for w in app.sidebar.number_input if "窗口" in w.label]
+    window = next(w for w in app.sidebar.date_input if w.label == "新入职判定窗口日期")
+    assert str(window.value) == "2026-06-30"
+
+
+def test_interns_are_included_and_counted(app):
+    intern_box = next(c for c in app.sidebar.checkbox if "纳入实习生" in c.label)
+    assert intern_box.value is True
+    assert "43 人" in intern_box.label
 
 
 def test_unmapped_groups_are_summarised_not_dumped(app):
     warnings = [block.value for block in app.warning]
-    assert any("22 名待新增人员" in text for text in warnings)
+    assert any("23 名待新增人员" in text for text in warnings)
     # 长长的分组清单要收进折叠区，而不是塞在警告文字里
     assert all(len(text) < 120 for text in warnings), warnings
+
+
+def test_same_person_under_two_names_is_reported_once(app):
+    warnings = " ".join(block.value for block in app.warning)
+    assert "有 1 人在两表里编号相同、姓名不同" in warnings
 
 
 def test_sidebar_defaults_pick_the_right_files(app):
@@ -63,17 +85,32 @@ def test_generate_marked_workbook_end_to_end(app):
     assert any("对照标记版" in d.label for d in downloads)
     success = " ".join(block.value for block in app.success)
     assert "标绿" in success and "标红" in success
-    # 22 名分组无法自动对应车间的人员应被跳过而不是硬塞进去
-    assert "跳过 22 人" in success
+    assert "按清单更新 16 人" in success
+    assert "实习生" in success
+    # 23 名分组无法自动对应车间的人员应被跳过而不是硬塞进去
+    assert "跳过 23 人" in success
 
 
-def test_window_change_reruns_without_error(app):
-    app.sidebar.number_input[0].set_value(6).run()
+def test_window_date_change_reruns_and_shifts_the_split(app):
+    window = next(w for w in app.sidebar.date_input if w.label == "新入职判定窗口日期")
+    baseline = {metric.label: metric.value for metric in app.metric}
+    window.set_value(dt.date(2026, 1, 1)).run()
+    assert not app.exception, [e.value for e in app.exception]
+    widened = {metric.label: metric.value for metric in app.metric}
+    assert int(widened["新入职员工"]) > int(baseline["新入职员工"])
+    assert int(widened["待定·需新增"]) < int(baseline["待定·需新增"])
+    window.set_value(dt.date(2026, 6, 30)).run()
+    assert not app.exception
+
+
+def test_turning_interns_off_shrinks_the_target_list(app):
+    intern_box = next(c for c in app.sidebar.checkbox if "纳入实习生" in c.label)
+    intern_box.set_value(False).run()
     assert not app.exception, [e.value for e in app.exception]
     values = {metric.label: metric.value for metric in app.metric}
-    assert int(values["新入职员工"]) > 213
-    app.sidebar.number_input[0].set_value(1).run()
-    assert not app.exception
+    assert values["新入职员工"] == "216"
+    intern_box.set_value(True).run()
+    assert {m.label: m.value for m in app.metric}["新入职员工"] == "252"
 
 
 def test_duty_field_switch_reruns_without_error(app):
@@ -123,7 +160,7 @@ def test_unticked_rows_stay_undecided():
     assert instance.session_state["decisions"] == {}
     next(b for b in instance.button if b.label == "生成对照标记版").click().run()
     messages = [block.value for block in instance.success]
-    assert any("新增 238 人" in text for text in messages), messages
+    assert any("新增 279 人" in text for text in messages), messages
 
 
 def test_cancel_column_removes_person_from_both_exports():
@@ -132,19 +169,19 @@ def test_cancel_column_removes_person_from_both_exports():
     assert list(instance.session_state["decisions"].values()) == ["取消"] * 2
     next(b for b in instance.button if b.label == "生成对照标记版").click().run()
     messages = [block.value for block in instance.success]
-    assert any("新增 236 人" in text for text in messages), messages
+    assert any("新增 277 人" in text for text in messages), messages
 
 
 def test_preview_counts_match_generated_counts():
     """预览"将新增 N 人"必须等于生成结果里的 N，未指定车间的人不能算进预览。"""
     instance = AppTest.from_file(APP, default_timeout=200).run()
     markdown = " ".join(block.value for block in instance.markdown)
-    assert "将新增 **238** 人" in markdown, markdown[-500:]
+    assert "将新增 **279** 人" in markdown, markdown[-500:]
     captions = " ".join(block.value for block in instance.caption)
-    assert "另有 22 人未指定车间" in captions
+    assert "另有 23 人未指定车间" in captions
     next(b for b in instance.button if b.label == "生成对照标记版").click().run()
-    assert any("新增 238 人" in block.value for block in instance.success)
+    assert any("新增 279 人" in block.value for block in instance.success)
 
     _tick(instance, "editor_新入职员工_0", [0], column="取消")
     markdown = " ".join(block.value for block in instance.markdown)
-    assert "将新增 **237** 人" in markdown
+    assert "将新增 **278** 人" in markdown

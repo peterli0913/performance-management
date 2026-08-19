@@ -26,8 +26,25 @@ def test_roster_duty_field_switch(roster_bytes):
     from tj4tools.roster import parse_roster
 
     by_post = parse_roster(roster_bytes, "x，07-31-2026.xlsx", duty_field="岗位")
-    # 按"岗位"过滤会把实习生（岗位记作助理工程师）也算进来
-    assert len(by_post.production) == 980
+    # 按「岗位」过滤时实习生仍被排除（默认 include_interns=False）
+    assert len(by_post.production) == 937
+    assert not any(p.is_intern for p in by_post.production.values())
+
+
+def test_interns_are_excluded_by_default_and_can_be_included(roster_bytes):
+    from tj4tools.roster import parse_roster
+
+    default = parse_roster(roster_bytes, "x，07-31-2026.xlsx")
+    assert len(default.production) == 935
+    assert not any(p.is_intern for p in default.production.values())
+
+    with_interns = parse_roster(roster_bytes, "x，07-31-2026.xlsx", include_interns=True)
+    interns = [p for p in with_interns.production.values() if p.is_intern]
+    assert len(with_interns.production) == 935 + 43
+    assert len(interns) == 43
+    # 实习生的「职位」是实习生、「岗位」是实际岗位，纳入时按岗位归入职务分组
+    assert all(p.title == "实习生" for p in interns)
+    assert {p.duty for p in interns} == {"操作工"}
 
 
 def test_bonus_parsing_shape(bonus):
@@ -54,9 +71,23 @@ def test_merged_workshop_is_filled_down(bonus):
 def test_conservation_of_headcount(result):
     counts = result.counts
     assert set(counts) == set(CATEGORIES)
-    assert sum(counts.values()) == (result.only_roster - result.excluded_in_others) + result.only_bonus
+    assert sum(counts.values()) == (
+        result.only_roster - result.excluded_in_others - result.paired_renames
+    ) + result.only_bonus
     assert result.matched + result.only_roster == 935
     assert result.matched + result.only_bonus == 673
+
+
+def test_same_eid_different_name_is_merged_not_double_counted(result):
+    """清单叫「曹睿晟」、核算叫「曹静旺」，同一个编号——改名即可，不能又加又删。"""
+    assert result.paired_renames == 1
+    update = next(i for i in result.items if i.key == ("曹静旺", "ALS14679"))
+    assert update.action == "update"
+    assert update.new_values["姓名"] == "曹睿晟"
+    assert any("按清单改名即可，不需要另外新增" in flag for flag in update.flags)
+    # 新增那一侧必须已经被撤掉，否则导出会出现两行同一个人
+    assert result.category_of("曹睿晟", "ALS14679") is None
+    assert any("编号相同、姓名不同" in note for note in result.notes)
 
 
 def test_known_people_land_in_right_category(result):
@@ -64,26 +95,44 @@ def test_known_people_land_in_right_category(result):
     assert result.category_of("周圣玮", "ALS18092") == CATEGORY_NEW
     # 离职表里有明确离职时间
     assert result.category_of("王子睿", "ALS15643") == CATEGORY_LEFT
-    # 核算表有、清单查不到离职记录（实际是升了工艺组长）
+    # 核算表有、清单查不到离职记录（实际是升了车间副主任）
     assert result.category_of("胡强", "ALS10148") == CATEGORY_PENDING_DEL
-    # 入职 2025-08-20，早于一个月窗口且变动说明无记录
-    assert result.category_of("曹睿晟", "ALS14679") == CATEGORY_PENDING_ADD
     # 已在「副主任&工艺组长及其他」子表，默认排除
     assert result.category_of("赵凯", "ALS11919") is None
 
 
-def test_new_hire_window_is_one_month(result):
-    assert result.window_start == dt.date(2026, 6, 30)
+def test_new_hire_since_defaults_to_one_month_before(result):
+    assert result.new_hire_since == dt.date(2026, 6, 30)
     for item in result.by_category(CATEGORY_NEW):
-        in_window = item.hire_date is not None and result.window_start <= item.hire_date <= result.ref_date
+        in_window = item.hire_date is not None and item.hire_date >= result.new_hire_since
         has_change_row = "人员变动说明" in item.reason and "离职时间为空" in item.reason
         assert in_window or has_change_row, item
+
+
+def test_new_hire_since_can_be_given_explicitly(roster, bonus):
+    early = reconcile(roster, bonus, new_hire_since=dt.date(2026, 1, 1))
+    late = reconcile(roster, bonus, new_hire_since=dt.date(2026, 7, 20))
+    assert early.new_hire_since == dt.date(2026, 1, 1)
+    assert early.counts[CATEGORY_NEW] > late.counts[CATEGORY_NEW]
+    assert sum(early.counts.values()) == sum(late.counts.values())
+    for item in late.by_category(CATEGORY_NEW):
+        if "人员变动说明" not in item.reason:
+            assert item.hire_date >= dt.date(2026, 7, 20)
 
 
 def test_pending_add_is_outside_window(result):
     for item in result.by_category(CATEGORY_PENDING_ADD):
         if item.hire_date is not None:
-            assert not (result.window_start <= item.hire_date <= result.ref_date)
+            assert item.hire_date < result.new_hire_since
+
+
+def test_hires_after_reference_date_still_count_as_new(result):
+    """窗口只有下界，晚于参照日期入职的人也是新入职（只是会被标出来）。"""
+    late = [i for i in result.items if i.hire_date and i.hire_date > result.ref_date]
+    assert late, "样本里应当有晚于参照日期入职的人"
+    for item in late:
+        assert item.category == CATEGORY_NEW
+        assert any("晚于参照日期" in flag for flag in item.flags)
 
 
 def test_left_people_have_evidence(result):
@@ -142,21 +191,43 @@ def test_unmappable_groups_are_reported(result):
 def test_exclude_in_others_can_be_disabled(roster, bonus):
     kept = reconcile(roster, bonus, exclude_in_others=False)
     assert kept.excluded_in_others == 0
-    assert sum(kept.counts.values()) == kept.only_roster + kept.only_bonus
+    assert sum(kept.counts.values()) == (
+        kept.only_roster - kept.paired_renames
+    ) + kept.only_bonus
     item = next(i for i in kept.items if i.key == ("赵凯", "ALS11919"))
     assert any("副主任" in flag for flag in item.flags)
 
 
-def test_window_months_changes_split(roster, bonus):
-    wide = reconcile(roster, bonus, window_months=6)
-    narrow = reconcile(roster, bonus, window_months=1)
-    assert wide.counts[CATEGORY_NEW] > narrow.counts[CATEGORY_NEW]
-    assert sum(wide.counts.values()) == sum(narrow.counts.values())
-
-
-def test_add_items_are_only_from_roster(result):
+def test_add_items_carry_roster_rows_and_removes_carry_frontline_rows(result):
     for item in result.items:
         if item.category in ADD_CATEGORIES:
+            assert item.action == "add"
             assert item.frontline_row == 0
+            assert item.roster_row >= 2
         else:
-            assert item.roster_row == 0
+            assert item.frontline_row >= 3
+
+
+def test_pending_delete_becomes_an_update(result):
+    """核算有清单无的人都能在「生产部」里找到本人，所以是改信息而不是删人。"""
+    items = result.by_category(CATEGORY_PENDING_DEL)
+    assert items
+    assert all(item.action == "update" for item in items)
+    assert all(item.updates for item in items)
+    assert all(item.roster_row >= 2 for item in items)
+    assert all("可按清单数据更新而不是删除" in item.reason for item in items)
+    # 离职人员仍然是删除
+    assert all(item.action == "remove" for item in result.by_category(CATEGORY_LEFT))
+
+
+def test_update_values_come_from_the_roster(result):
+    promoted = next(i for i in result.items if i.key == ("胡强", "ALS10148"))
+    assert promoted.updates == {"职务": ("班长", "车间副主任")}
+    assert promoted.new_values["职务"] == "车间副主任"
+    assert promoted.new_values["姓名"] == "胡强"
+
+    # 编号相同、姓名不同（清单里名字带零宽字符）——改的是姓名
+    renamed = next(i for i in result.items if i.key == ("曹静旺", "ALS14679"))
+    assert renamed.updates == {"姓名": ("曹静旺", "曹睿晟")}
+    assert renamed.new_values["姓名"] == "曹睿晟"
+    assert renamed.update_text == "姓名 曹静旺→曹睿晟"

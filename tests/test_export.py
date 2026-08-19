@@ -22,7 +22,8 @@ def _mapped(result, categories=None):
 def marked(bonus_bytes, bonus, result):
     adds = _mapped(result)
     removes = [i for i in result.items if i.action == "remove"]
-    data, summary = build_workbook(bonus_bytes, bonus, adds, removes, mode="mark")
+    updates = [i for i in result.items if i.action == "update"]
+    data, summary = build_workbook(bonus_bytes, bonus, adds, removes, updates, mode="mark")
     return data, summary, adds, removes
 
 
@@ -65,28 +66,98 @@ def test_row_count_and_values(marked):
         assert (item.name, item.eid) in names, item
 
 
-def test_inserted_rows_sit_at_bottom_of_their_workshop(bonus, marked):
-    data, _, adds, _ = marked
+def test_inserted_rows_sit_at_bottom_of_their_duty_run(bonus_bytes, bonus, result):
+    """新增助工要落在该车间助工那一段的最下面，而不是整个车间块的最下面。
+
+    这里刻意只做新增：更新会改写「职务」列的值，会干扰"上一行是同职务"的判断。
+    """
+    adds = _mapped(result)
+    data, _ = build_workbook(bonus_bytes, bonus, adds, [], [], mode="mark")
     workbook = openpyxl.load_workbook(io.BytesIO(data))
     sheet = workbook[SHEET]
-    merged = {}
+    blocks = {}
     for merge in sheet.merged_cells.ranges:
-        if merge.min_col == 1 == merge.max_col:
+        if merge.min_col == 1 == merge.max_col and merge.min_row >= 3:
             label = sheet.cell(merge.min_row, 1).value
             if label:
-                merged[str(label).strip()] = (merge.min_row, merge.max_row)
-    per_workshop = {}
+                blocks[str(label).strip()] = (merge.min_row, merge.max_row)
+
+    grouped = {}
     for item in adds:
-        per_workshop.setdefault(item.workshop, []).append(item)
-    for workshop, items in per_workshop.items():
-        start, end = merged[workshop]
-        # 合并区终点必须顺延，新增人员正好占据块尾
-        tail = [
-            (str(sheet.cell(row, 3).value), str(sheet.cell(row, 4).value))
-            for row in range(end - len(items) + 1, end + 1)
+        grouped.setdefault((item.workshop, item.duty), []).append(item)
+    checked = 0
+    for (workshop, duty), items in grouped.items():
+        anchor, exact = bonus.anchor_for(workshop, duty)
+        if not exact:
+            continue
+        start, end = blocks[workshop]
+        rows = [
+            row
+            for row in range(start, end + 1)
+            if (str(sheet.cell(row, 3).value or ""), str(sheet.cell(row, 4).value or ""))
+            in {(i.name, i.eid) for i in items}
         ]
-        assert tail == [(i.name, i.eid) for i in items], workshop
-        assert start == merged[workshop][0]
+        assert len(rows) == len(items), (workshop, duty)
+        # 必须连续，且紧接在该职务原有最后一行之后
+        assert rows == list(range(rows[0], rows[0] + len(rows)))
+        assert str(sheet.cell(rows[0] - 1, 2).value).strip() == duty, (workshop, duty)
+        # 后面一行要么出块，要么是别的职务（说明我们确实停在这一段末尾）
+        following = sheet.cell(rows[-1] + 1, 2).value
+        if rows[-1] < end:
+            assert str(following).strip() != duty, (workshop, duty)
+        checked += 1
+    assert checked >= 20
+
+
+def test_duty_runs_stay_grouped_inside_each_block(bonus, marked):
+    """插入后，每个车间块内同职务仍应聚在一起（段数不增加）。"""
+    data, _, _, _ = marked
+    workbook = openpyxl.load_workbook(io.BytesIO(data))
+    sheet = workbook[SHEET]
+    for merge in sheet.merged_cells.ranges:
+        if merge.min_col != 1 or merge.max_col != 1 or merge.min_row < 3:
+            continue
+        workshop = str(sheet.cell(merge.min_row, 1).value or "").strip()
+        duties = [
+            str(sheet.cell(row, 2).value or "").strip()
+            for row in range(merge.min_row, merge.max_row + 1)
+            if sheet.cell(row, 3).value
+        ]
+        runs = [d for index, d in enumerate(duties) if index == 0 or duties[index - 1] != d]
+        original_runs = _run_count(
+            [
+                str(sheet.cell(row, 2).value or "").strip()
+                for row in range(merge.min_row, merge.max_row + 1)
+                if sheet.cell(row, 3).value
+            ]
+        )
+        assert len(runs) == original_runs, (workshop, runs)
+
+
+def _run_count(duties):
+    return sum(1 for index, d in enumerate(duties) if index == 0 or duties[index - 1] != d)
+
+
+def test_duty_run_count_does_not_grow(bonus_bytes, bonus, result):
+    """插入后同职务不应被拆成更多段（更新写入的新职务除外，单独算）。"""
+    adds = _mapped(result)
+    data, _ = build_workbook(bonus_bytes, bonus, adds, [], [], mode="mark")
+    workbook = openpyxl.load_workbook(io.BytesIO(data))
+    sheet = workbook[SHEET]
+    for merge in sheet.merged_cells.ranges:
+        if merge.min_col != 1 or merge.max_col != 1 or merge.min_row < 3:
+            continue
+        workshop = str(sheet.cell(merge.min_row, 1).value or "").strip()
+        duties = [
+            str(sheet.cell(row, 2).value or "").strip()
+            for row in range(merge.min_row, merge.max_row + 1)
+            if sheet.cell(row, 3).value
+        ]
+        _, start, end = bonus.block_of(workshop)
+        before = _run_count(
+            [p.duty for p in bonus.frontline.values() if start <= p.row <= end]
+        )
+        assert _run_count(duties) == before, (workshop, duties)
 
 
 def test_inserted_row_formulas_reference_their_own_row(marked):
@@ -101,6 +172,44 @@ def test_inserted_row_formulas_reference_their_own_row(marked):
         assert sheet.cell(row, 6).value == f"=(K{row}+G{row}+H{row}+I{row}-J{row})"
         assert f"C{row}" in sheet.cell(row, 7).value
         assert f"L{row}:AP{row}" in sheet.cell(row, 11).value
+        checked += 1
+    assert checked == len(adds)
+
+
+def test_new_rows_never_inherit_block_statistics_formulas(marked):
+    """AQ/AR/AS 是按车间块统计的，只应留在原来的那些行上，不能被新行复制。"""
+    data, _, adds, _ = marked
+    workbook = openpyxl.load_workbook(io.BytesIO(data), data_only=False)
+    sheet = workbook[SHEET]
+    add_keys = {(i.name, i.eid) for i in adds}
+    for row in range(3, sheet.max_row + 1):
+        key = (str(sheet.cell(row, 3).value or ""), str(sheet.cell(row, 4).value or ""))
+        if key not in add_keys:
+            continue
+        for column in (43, 44, 45):
+            assert sheet.cell(row, column).value is None, (row, column)
+
+
+def test_broken_source_formula_is_not_propagated(bonus_bytes, bonus, result):
+    """源文件 G342/H342/J342 本来就是 #REF!，新增行不能跟着坏掉。"""
+    source = openpyxl.load_workbook(io.BytesIO(bonus_bytes), data_only=False)[SHEET]
+    assert "#REF!" in source["G342"].value, "样本文件应当带着这个已知的坏公式"
+
+    adds = [i for i in _mapped(result) if i.workshop == "5号楼" and i.duty == "助工"]
+    assert adds
+    data, summary = build_workbook(bonus_bytes, bonus, adds, [], [], mode="mark")
+    assert any("#REF!" in warning for warning in summary.warnings)
+    sheet = openpyxl.load_workbook(io.BytesIO(data), data_only=False)[SHEET]
+    add_keys = {(i.name, i.eid) for i in adds}
+    checked = 0
+    for row in range(3, sheet.max_row + 1):
+        key = (str(sheet.cell(row, 3).value or ""), str(sheet.cell(row, 4).value or ""))
+        if key not in add_keys:
+            continue
+        for column in (7, 8, 10):
+            formula = sheet.cell(row, column).value
+            assert "#REF!" not in formula, (row, column, formula)
+            assert f"C{row}" in formula
         checked += 1
     assert checked == len(adds)
 
@@ -214,6 +323,88 @@ def test_new_rows_are_green_and_removed_rows_red(marked):
             reds += 1
     assert greens == len(adds)
     assert reds == len(removes)
+
+
+def test_apply_mode_marks_new_rows_with_red_font(bonus_bytes, bonus, result):
+    adds = _mapped(result)[:12]
+    data, _ = build_workbook(bonus_bytes, bonus, adds, [], [], mode="apply")
+    sheet = openpyxl.load_workbook(io.BytesIO(data))[SHEET]
+    add_keys = {(i.name, i.eid) for i in adds}
+    checked = 0
+    for row in range(3, sheet.max_row + 1):
+        key = (str(sheet.cell(row, 3).value or ""), str(sheet.cell(row, 4).value or ""))
+        if key not in add_keys:
+            continue
+        reference = sheet.cell(4, 3)
+        for column in (2, 3, 4, 5):
+            cell = sheet.cell(row, column)
+            assert cell.font.color is not None and cell.font.color.rgb == "FFFF0000", (row, column)
+            # 只改颜色，字号字体保持不变
+            assert cell.font.name == reference.font.name
+            assert cell.font.sz == reference.font.sz
+            assert cell.fill.fgColor.rgb != "FF92D050"
+        checked += 1
+    assert checked == len(adds)
+    # 原有行的字体颜色不能被动到
+    assert sheet.cell(4, 3).font.color is None or sheet.cell(4, 3).font.color.rgb != "FFFF0000"
+
+
+def test_interns_get_a_yellow_duty_cell(bonus_bytes, roster_bytes, bonus):
+    from tj4tools.roster import parse_roster, reconcile
+
+    roster = parse_roster(
+        roster_bytes, "TJ4生产部&生产设备部人员清单，07-31-2026.xlsx", include_interns=True
+    )
+    analysis = reconcile(roster, bonus)
+    interns = [i for i in analysis.items if i.action == "add" and i.workshop and i.is_intern]
+    assert len(interns) >= 30, "纳入实习生后应当有一批实习生待新增"
+    for mode in ("mark", "apply"):
+        data, summary = build_workbook(bonus_bytes, bonus, interns, [], [], mode=mode)
+        assert summary.interns == len(interns)
+        sheet = openpyxl.load_workbook(io.BytesIO(data))[SHEET]
+        keys = {(i.name, i.eid) for i in interns}
+        found = 0
+        for row in range(3, sheet.max_row + 1):
+            key = (str(sheet.cell(row, 3).value or ""), str(sheet.cell(row, 4).value or ""))
+            if key not in keys:
+                continue
+            assert sheet.cell(row, 2).fill.fgColor.rgb == "FFFFFF00", (mode, row)
+            found += 1
+        assert found == len(interns), mode
+
+
+def test_updates_rewrite_the_row_with_roster_values(bonus_bytes, bonus, result):
+    updates = [i for i in result.items if i.action == "update"]
+    assert len(updates) == 16
+    promoted = next(i for i in updates if i.key == ("胡强", "ALS10148"))
+    renamed = next(i for i in updates if i.key == ("曹静旺", "ALS14679"))
+
+    data, summary = build_workbook(bonus_bytes, bonus, [], [], updates, mode="mark")
+    assert summary.updated == 16
+    sheet = openpyxl.load_workbook(io.BytesIO(data))[SHEET]
+    # 没有插入也没有删除，行号保持原样
+    assert sheet.max_row == 676
+    assert sheet.cell(promoted.frontline_row, 2).value == "车间副主任"
+    assert sheet.cell(promoted.frontline_row, 2).fill.fgColor.rgb == "FFFFC000"
+    # 没有差异的列不能被着色
+    assert sheet.cell(promoted.frontline_row, 3).fill.fgColor.rgb != "FFFFC000"
+    assert sheet.cell(renamed.frontline_row, 3).value == "曹睿晟"
+    assert sheet.cell(renamed.frontline_row, 3).fill.fgColor.rgb == "FFFFC000"
+
+    plain, _ = build_workbook(bonus_bytes, bonus, [], [], updates, mode="apply")
+    sheet = openpyxl.load_workbook(io.BytesIO(plain))[SHEET]
+    assert sheet.cell(promoted.frontline_row, 2).value == "车间副主任"
+    assert sheet.cell(promoted.frontline_row, 2).fill.fgColor.rgb != "FFFFC000"
+
+
+def test_update_keeps_the_row_formulas_intact(bonus_bytes, bonus, result):
+    updates = [i for i in result.items if i.action == "update"]
+    data, _ = build_workbook(bonus_bytes, bonus, [], [], updates, mode="apply")
+    sheet = openpyxl.load_workbook(io.BytesIO(data), data_only=False)[SHEET]
+    for item in updates:
+        row = item.frontline_row
+        assert sheet.cell(row, 6).value == f"=(K{row}+G{row}+H{row}+I{row}-J{row})"
+        assert sheet.cell(row, 5).is_date or sheet.cell(row, 5).value is None
 
 
 def _strip(key):
