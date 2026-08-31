@@ -153,7 +153,11 @@ def build_workbook(
         )
         if item.is_intern:
             highlights.append(
-                Highlight(row=item.frontline_row, cols=[columns["duty"]], color=FILL_YELLOW)
+                Highlight(
+                    row=item.frontline_row,
+                    cols=[columns[key] for key in ("duty", "name", "eid", "hire")],
+                    color=FILL_YELLOW,
+                )
             )
             summary.interns += 1
         summary.updated += 1
@@ -336,12 +340,14 @@ def _new_row(
         values[columns["workshop"]] = workshop
     fills: dict[str, str] = {}
     fonts: dict[str, str] = {}
-    if mode == "mark":
+    if item.is_intern:
+        # 实习生统一用整片黄色底纹，并且不叠红字——否则在已应用版里红字会盖过黄底，
+        # 看上去就是"红色的"，分不出实习生。
+        fills = {column: FILL_YELLOW for column in values}
+    elif mode == "mark":
         fills = {columns["name"]: FILL_GREEN, columns["eid"]: FILL_GREEN}
     else:
         fonts = {column: FONT_RED for column in values}
-    if item.is_intern:
-        fills[columns["duty"]] = FILL_YELLOW
     return NewRow(values=values, fills=fills, font_colors=fonts)
 
 

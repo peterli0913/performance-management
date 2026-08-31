@@ -44,6 +44,7 @@ from .roster import (
     build_others_workshop_map,
     classify_intern,
     departure_evidence,
+    intern_is_countable,
     months_before,
     new_hire_evidence,
 )
@@ -87,24 +88,27 @@ def build_target(
     *,
     scope: str = SCOPE_STRICT,
     placeable_keys: set[tuple[str, str]] | None = None,
-) -> tuple[dict[tuple[str, str], Person], dict[tuple[str, str], str]]:
-    """返回 (目标人群, 每个人属于哪一组)。"""
+    intern_asof: _dt.date | None = None,
+) -> tuple[dict[tuple[str, str], Person], dict[tuple[str, str], str], int]:
+    """返回 (目标人群, 每个人属于哪一组, 因判断日期被排除的实习生数)。"""
     frontline = set(bonus.frontline)
     placeable = placeable_keys or set()
     target: dict[tuple[str, str], Person] = {}
     groups: dict[tuple[str, str], str] = {}
+    late_interns = 0
     for key, person in roster.production_all.items():
-        if person.title in MANAGEMENT_TITLES:
-            target[key] = person
-            groups[key] = "管理类职务"
+        management = person.title in MANAGEMENT_TITLES
+        if not management and (person.title not in FRONTLINE_TITLES or key in frontline):
             continue
-        if person.title not in FRONTLINE_TITLES or key in frontline:
+        if not management and scope == SCOPE_STRICT and key in placeable:
             continue
-        if scope == SCOPE_STRICT and key in placeable:
+        if not intern_is_countable(person, intern_asof):
+            # 判断日期之后入职的实习生不加入表格
+            late_interns += 1
             continue
         target[key] = person
-        groups[key] = "一线四职务·不在一线人员表"
-    return target, groups
+        groups[key] = "管理类职务" if management else "一线四职务·不在一线人员表"
+    return target, groups, late_interns
 
 
 def reconcile_supervisors(
@@ -131,7 +135,9 @@ def reconcile_supervisors(
 
     duty_map = build_duty_map(roster, bonus)
     workshop_map = build_others_workshop_map(roster, bonus)
-    target, groups = build_target(roster, bonus, scope=scope, placeable_keys=placeable_keys)
+    target, groups, late_interns = build_target(
+        roster, bonus, scope=scope, placeable_keys=placeable_keys, intern_asof=intern_asof
+    )
 
     current = layout.people
     target_keys = set(target)
@@ -215,6 +221,10 @@ def reconcile_supervisors(
         + "、".join(f"{name} {count} 人" for name, count in scope_counts.items())
         + f"），本表现有 {len(current_keys)} 人。"
     )
+    if late_interns:
+        notes.append(
+            f"有 {late_interns} 名实习生在判断日期 {intern_asof} 之后入职，按规则不加入表格"
+        )
 
     return Reconciliation(
         items=items,
@@ -231,11 +241,15 @@ def reconcile_supervisors(
     )
 
 
-def target_summary(roster: RosterFile, bonus: BonusFile, placeable_keys) -> dict[str, int]:
-    """两种口径各自的目标人数，用来在界面上把选择的后果说清楚。"""
+def target_summary(
+    roster: RosterFile, bonus: BonusFile, placeable_keys, intern_asof=None
+) -> dict[str, int]:
+    """两种口径各自的目标人数（口径已固定为严格，这个函数只用于对比说明）。"""
     out = {}
     for scope in SCOPES:
-        target, _ = build_target(roster, bonus, scope=scope, placeable_keys=placeable_keys)
+        target, _, _ = build_target(
+            roster, bonus, scope=scope, placeable_keys=placeable_keys, intern_asof=intern_asof
+        )
         out[scope] = len(target)
     return out
 

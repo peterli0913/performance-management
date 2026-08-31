@@ -171,17 +171,39 @@ def test_intern_classification(roster_with_interns, bonus):
     assert later.intern_counts[INTERN_SENIOR] > analysis.intern_counts[INTERN_SENIOR]
 
 
-def test_intern_classification_flags_impossible_dates(roster_with_interns, bonus):
-    """判断日期早于入职日期时算不出时长，单独归到"入职日期异常"而不是硬塞进某一类。"""
-    from tj4tools.roster import INTERN_JUNIOR, INTERN_UNKNOWN
+def test_interns_hired_after_the_judgement_date_are_not_added(roster_with_interns, bonus):
+    """只有判断日期**之前**入职的实习生才加入表格，之后入职的直接不加。"""
+    asof = dt.date(2026, 5, 1)
+    early = reconcile(roster_with_interns, bonus, intern_asof=asof)
+    baseline = reconcile(roster_with_interns, bonus, intern_asof=dt.date(2026, 7, 31))
 
-    early = reconcile(roster_with_interns, bonus, intern_asof=dt.date(2026, 5, 1))
-    assert early.intern_counts[INTERN_UNKNOWN] > 40
-    assert INTERN_JUNIOR not in early.intern_counts
+    assert early.excluded_late_interns == 45
+    assert baseline.excluded_late_interns == 0
+    # 被排除的人不会出现在任何分类里
+    assert sum(early.counts.values()) == sum(baseline.counts.values()) - 45
+    assert any("之后入职，按规则不加入表格" in note for note in early.notes)
+    # 留下来的实习生一定是判断日期之前入职的
     for item in early.items:
-        if item.intern_class == INTERN_UNKNOWN:
-            assert item.hire_date is None or item.hire_date >= dt.date(2026, 5, 1)
-            assert any("无法计算入职时长" in flag for flag in item.flags)
+        if item.is_intern:
+            assert item.hire_date is not None and item.hire_date < asof, item
+
+
+def test_late_interns_do_not_break_conservation(roster_with_interns, bonus):
+    result = reconcile(roster_with_interns, bonus, intern_asof=dt.date(2026, 5, 1))
+    assert sum(result.counts.values()) == (
+        result.only_roster
+        - result.excluded_in_others
+        - result.excluded_late_interns
+        - result.paired_renames
+    ) + result.only_bonus
+
+
+def test_non_interns_are_not_affected_by_the_judgement_date(roster_with_interns, bonus):
+    early = reconcile(roster_with_interns, bonus, intern_asof=dt.date(2026, 1, 1))
+    late = reconcile(roster_with_interns, bonus, intern_asof=dt.date(2026, 7, 31))
+    non_intern_early = {i.key for i in early.items if not i.is_intern}
+    non_intern_late = {i.key for i in late.items if not i.is_intern}
+    assert non_intern_early == non_intern_late
 
 
 def test_left_people_have_evidence(result):

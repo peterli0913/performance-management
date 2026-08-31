@@ -157,7 +157,11 @@ def cached_db_bytes(payload: tuple[tuple[str, bytes], ...]) -> bytes:
 # --------------------------------------------------------------------------- #
 
 
-STATE_KEYS = ("decisions", "workshop_override", "mapping_override")
+STATE_KEYS = ("decisions", "workshop_override", "mapping_override", "action_override")
+
+ACTION_KEEP = "保留在一线人员"
+ACTION_TO_OTHERS = "移动到副主任表格"
+PENDING_DEL_ACTIONS = (ACTION_TO_OTHERS, ACTION_KEEP)
 
 
 class Review:
@@ -186,6 +190,10 @@ class Review:
     @property
     def mapping_override(self) -> dict:
         return st.session_state[self.key("mapping_override")]
+
+    @property
+    def action_override(self) -> dict:
+        return st.session_state[self.key("action_override")]
 
     def decision_of(self, label: str) -> str:
         return self.decisions.get(label, UNDECIDED)
@@ -365,64 +373,115 @@ def effective_group_workshop(review: Review, group: str, mapping) -> str:
 # --------------------------------------------------------------------------- #
 
 
-# 「待定·核算有清单无」的人多半没离职，只是信息变了，所以这两个开关是"用哪份数据"
-CHOICE_LABELS = {
-    CATEGORY_PENDING_DEL: ("用清单数据", "沿用核算数据"),
-}
-DEFAULT_LABELS = ("应用", "取消")
-
-
 def choice_labels(category: str) -> tuple[str, str]:
-    return CHOICE_LABELS.get(category, DEFAULT_LABELS)
+    """勾选框/按钮的文案必须写清楚具体动作，不能只写"应用/取消"。
+
+    由 render_category 的调用方按"这一类要做什么"传进来。
+    """
+    return CHOICE_LABELS.get(category, ("应用", "取消"))
 
 
-def render_auto_applied(category, items) -> None:
-    """「待定·核算有清单无」不需要人工复核：全部按清单数据处理，只把清单和动作列出来。"""
+# 每一类的动作文案：(勾上的动作, 不勾的动作)
+LABELS_ADD_FRONTLINE = ("新增到一线人员", "不新增")
+LABELS_REMOVE_FRONTLINE = ("从一线人员删除", "保留在一线人员")
+LABELS_ADD_OTHERS = ("新增到副主任表", "不新增")
+LABELS_REMOVE_OTHERS = ("从副主任表删除", "保留在副主任表")
+
+CHOICE_LABELS: dict[str, tuple[str, str]] = {}
+
+
+def set_choice_labels(mapping: dict[str, tuple[str, str]]) -> None:
+    """切换功能时重设各分类的动作文案（两张子表的动作说法不一样）。"""
+    CHOICE_LABELS.clear()
+    CHOICE_LABELS.update(mapping)
+
+
+def effective_pending_action(review: Review, item) -> str:
+    """「待定·核算有清单无」的最终动作：人工选过就用人工的，否则用自动判定的。"""
+    override = review.action_override.get(item.label)
+    if override in PENDING_DEL_ACTIONS:
+        return override
+    return ACTION_TO_OTHERS if item.action == "move" else ACTION_KEEP
+
+
+def render_pending_delete(review: Review, category, items) -> None:
+    """「待定·核算有清单无」：自动给出动作，但每个人都可以手工改成另一个动作。"""
     if not items:
         st.success(f"没有「{category}」人员")
         return
-    moves = [item for item in items if item.action == "move"]
-    keeps = [item for item in items if item.action != "move"]
+    decided = [effective_pending_action(review, item) for item in items]
     metrics = st.columns([1, 1, 1, 4])
     metrics[0].metric("总数", len(items))
-    metrics[1].metric("保留并更新", len(keeps))
-    metrics[2].metric("移到副主任表", len(moves))
+    metrics[1].metric("保留在一线人员", decided.count(ACTION_KEEP))
+    metrics[2].metric("移动到副主任表格", decided.count(ACTION_TO_OTHERS))
     st.info(
         "这些人在核算表里有、在清单目标职务里没有，但都能在「生产部」里找到本人"
-        "（多为职务变动或姓名录错）。**全部按人员清单的信息处理，无需复核**：\n\n"
-        "- 更新后职务仍是助工/操作工/工程师/班长 → **保留在「一线人员」**并按清单改写\n"
-        "- 更新后职务不是这四种 → **移到「副主任&工艺组长及其他」子表**（从一线人员移除）"
+        "（多为职务变动或姓名录错），所以都按人员清单的信息处理。"
+        "**动作列可以逐人改**：\n\n"
+        f"- **{ACTION_KEEP}**：留在「一线人员」，并按清单改写姓名/员工编号/职务/入职日期\n"
+        f"- **{ACTION_TO_OTHERS}**：从「一线人员」移除，写进「副主任&工艺组长及其他」对应车间\n\n"
+        "默认按清单职务判：仍是助工/操作工/工程师/班长的保留，不是这四种的移走。"
     )
+    bulk = st.columns([1.7, 1.7, 1.1, 4])
+    if bulk[0].button(f"全部改为「{ACTION_KEEP}」", key=review.widget("all_keep", category)):
+        for item in items:
+            review.action_override[item.label] = ACTION_KEEP
+        review.bump(category)
+        st.rerun()
+    if bulk[1].button(f"全部改为「{ACTION_TO_OTHERS}」", key=review.widget("all_move", category)):
+        for item in items:
+            review.action_override[item.label] = ACTION_TO_OTHERS
+        review.bump(category)
+        st.rerun()
+    if bulk[2].button("恢复自动判定", key=review.widget("all_auto", category)):
+        for item in items:
+            review.action_override.pop(item.label, None)
+        review.bump(category)
+        st.rerun()
+
+    order = ["动作", "姓名", "员工编号", "原一线车间", "核算职务", "清单职务", "目标车间",
+             "修改内容", "入职时间", "实习生", "自动判定", "判定依据"]
     frame = pd.DataFrame(
         [
             {
+                "动作": action,
                 "姓名": item.name,
                 "员工编号": item.eid,
                 "原一线车间": item.workshop,
                 "核算职务": item.duty,
                 "清单职务": str(item.new_values.get("职务") or ""),
-                "动作": item.action_text,
-                "目标车间依据": item.target_workshop_source,
+                "目标车间": item.target_workshop if action == ACTION_TO_OTHERS else "—",
                 "修改内容": item.update_text or "（无字段变化）",
                 "入职时间": fmt_date(item.hire_date),
                 "实习生": item.intern_text,
+                "自动判定": ACTION_TO_OTHERS if item.action == "move" else ACTION_KEEP,
                 "判定依据": item.reason,
             }
-            for item in items
+            for item, action in zip(items, decided)
         ]
-    )
-    st.dataframe(
+    )[order]
+    edited = st.data_editor(
         frame,
         hide_index=True,
         width="stretch",
         height=min(640, 90 + 35 * len(frame)),
+        key=review.widget("pending_editor", category, review.version(category)),
         column_config={
+            "动作": st.column_config.SelectboxColumn(
+                options=list(PENDING_DEL_ACTIONS), required=True, width="medium"
+            ),
             "姓名": st.column_config.TextColumn(width="small"),
             "员工编号": st.column_config.TextColumn(width="small"),
-            "动作": st.column_config.TextColumn(width="large"),
             "判定依据": st.column_config.TextColumn(width="large"),
         },
+        disabled=[column for column in order if column != "动作"],
     )
+    for item, before, after in zip(items, frame["动作"], edited["动作"]):
+        if after != before:
+            review.action_override[item.label] = after
+    st.caption("这一类不用勾「应用/取消」——动作列选什么就执行什么，两个导出都会照此处理。")
+
+    moves = [item for item, action in zip(items, decided) if action == ACTION_TO_OTHERS]
     unmapped = [item for item in moves if not item.target_workshop]
     if unmapped:
         st.warning(
@@ -630,8 +689,14 @@ def render_export(review: Review, bonus_bytes, bonus, analysis, include_pending)
         if item.category in (CATEGORY_NEW, CATEGORY_LEFT)
         or include_pending.get(item.category, True)
     ]
-    # 「待定·核算有清单无」按需求全部自动按清单处理，不参与人工复核
-    auto = [resolved(i) for i in selectable if i.category == CATEGORY_PENDING_DEL]
+    # 「待定·核算有清单无」不走应用/取消，而是按各自的"动作"列执行
+    auto = []
+    for item in selectable:
+        if item.category != CATEGORY_PENDING_DEL:
+            continue
+        action = effective_pending_action(review, item)
+        item.action = "move" if action == ACTION_TO_OTHERS else "update"
+        auto.append(resolved(item))
     reviewed = [i for i in selectable if i.category != CATEGORY_PENDING_DEL]
     kept = auto + [resolved(i) for i in reviewed if decisions.get(i.label) != CANCEL]
     approved = auto + [resolved(i) for i in reviewed if decisions.get(i.label) == APPLY]
@@ -953,6 +1018,13 @@ def render_frontline_feature(payload, result, bonus, analysis, options_) -> None
     review = Review("")
     bonus_name = options_["bonus_name"]
     include_pending = options_["include_pending"]
+    set_choice_labels(
+        {
+            CATEGORY_NEW: LABELS_ADD_FRONTLINE,
+            CATEGORY_PENDING_ADD: LABELS_ADD_FRONTLINE,
+            CATEGORY_LEFT: LABELS_REMOVE_FRONTLINE,
+        }
+    )
     st.caption(
         "比对人员清单「生产部」里职务为助工/操作工/工程师/班长的人员与核算数据「一线人员」子表，"
         "分出新入职、离职、两类待定，并生成保留原格式与公式的新核算表。"
@@ -1004,7 +1076,7 @@ def render_frontline_feature(payload, result, bonus, analysis, options_) -> None
     for tab, category in zip(tabs, CATEGORIES):
         with tab:
             if category == CATEGORY_PENDING_DEL:
-                render_auto_applied(category, analysis.by_category(category))
+                render_pending_delete(review, category, analysis.by_category(category))
             else:
                 render_category(
                     review,
@@ -1023,6 +1095,14 @@ def render_frontline_feature(payload, result, bonus, analysis, options_) -> None
 def render_supervisor_feature(payload, result, roster, bonus, frontline_analysis, options_) -> None:
     review = Review("sup")
     bonus_name = options_["bonus_name"]
+    set_choice_labels(
+        {
+            CATEGORY_NEW: LABELS_ADD_OTHERS,
+            CATEGORY_PENDING_ADD: LABELS_ADD_OTHERS,
+            CATEGORY_LEFT: LABELS_REMOVE_OTHERS,
+            CATEGORY_PENDING_DEL: LABELS_REMOVE_OTHERS,
+        }
+    )
     st.caption(
         "从人员清单生成「副主任&工艺组长及其他」子表：取**管理类职务**（车间副主任/工艺组长/经理），"
         "外加**不在「一线人员」子表、且功能一也放不进一线车间的**助工/工程师/操作工/班长——"

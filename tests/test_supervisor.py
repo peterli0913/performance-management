@@ -65,7 +65,7 @@ def test_two_scopes_differ_by_an_order_of_magnitude(roster_with_interns, bonus, 
 
 
 def test_target_is_management_plus_leftover_frontline(roster_with_interns, bonus, placeable):
-    target, groups = build_target(
+    target, groups, _ = build_target(
         roster_with_interns, bonus, scope=SCOPE_STRICT, placeable_keys=placeable
     )
     management = [k for k, g in groups.items() if g == "管理类职务"]
@@ -81,10 +81,10 @@ def test_target_is_management_plus_leftover_frontline(roster_with_interns, bonus
 
 
 def test_strict_scope_excludes_people_feature_one_can_place(roster_with_interns, bonus, placeable):
-    strict_target, _ = build_target(
+    strict_target, _, _ = build_target(
         roster_with_interns, bonus, scope=SCOPE_STRICT, placeable_keys=placeable
     )
-    literal_target, _ = build_target(
+    literal_target, _, _ = build_target(
         roster_with_interns, bonus, scope=SCOPE_LITERAL, placeable_keys=placeable
     )
     extra = set(literal_target) - set(strict_target)
@@ -305,23 +305,33 @@ def test_mark_mode_colors(generated):
         assert sheet.cell(row, 4).fill.fgColor.rgb == "FFFF0000", item.name
     for item in generated["adds"]:
         row = rows[item.name]
-        assert sheet.cell(row, 3).fill.fgColor.rgb == "FF92D050", item.name
+        # 实习生走黄底，其余新增走绿底
+        expected = "FFFFFF00" if item.is_intern else "FF92D050"
+        assert sheet.cell(row, 3).fill.fgColor.rgb == expected, item.name
 
 
 def test_apply_mode_uses_red_font(generated):
-    """只改字体颜色，字体名和字号沿用同一段的原有行（这张表各块字体并不统一）。"""
+    """非实习生的新增行只改字体颜色，字体名和字号沿用同一段的原有行
+    （这张表各块字体并不统一）；实习生不叠红字，走整片黄底。"""
     data, _ = generated["apply"]
     sheet = openpyxl.load_workbook(io.BytesIO(data))[SHEET]
-    add_names = {i.name for i in generated["adds"]}
-    checked = 0
+    by_name = {i.name: i for i in generated["adds"]}
+    checked = interns = 0
     for row in range(2, sheet.max_row + 1):
-        if str(sheet.cell(row, 3).value or "") not in add_names:
+        item = by_name.get(str(sheet.cell(row, 3).value or ""))
+        if item is None:
             continue
         cell = sheet.cell(row, 3)
         above = sheet.cell(row - 1, 3)
-        assert cell.font.color is not None and cell.font.color.rgb == "FFFF0000"
-        assert cell.font.name == above.font.name, row
-        assert cell.font.sz == above.font.sz, row
-        assert cell.fill.fgColor.rgb != "FF92D050"
+        if item.is_intern:
+            assert cell.fill.fgColor.rgb == "FFFFFF00", item.name
+            assert cell.font.color is None or cell.font.color.rgb != "FFFF0000", item.name
+            interns += 1
+        else:
+            assert cell.font.color is not None and cell.font.color.rgb == "FFFF0000"
+            assert cell.font.name == above.font.name, row
+            assert cell.font.sz == above.font.sz, row
+            assert cell.fill.fgColor.rgb != "FF92D050"
         checked += 1
-    assert checked == len(add_names)
+    assert checked == len(by_name)
+    assert interns >= 1, "样本里应当有实习生走黄底这条分支"

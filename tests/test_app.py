@@ -117,17 +117,45 @@ def test_intern_classification_is_shown_and_configurable(app):
     asof.set_value(dt.date(2026, 7, 31)).run()
 
 
-def test_pending_delete_tab_is_read_only_and_lists_actions(app):
-    text = " ".join(block.value for block in app.markdown) + " ".join(
-        block.value for block in app.info
-    )
-    assert "全部按人员清单的信息处理，无需复核" in text
-    assert "移到「副主任&工艺组长及其他」子表" in text
-    labels = {metric.label for metric in app.metric}
-    assert {"保留并更新", "移到副主任表"} <= labels
+def test_pending_delete_tab_offers_a_per_person_action_choice(app):
+    """待定·核算有清单无：给出自动判定，但每个人的动作都能手工改。"""
+    text = " ".join(block.value for block in app.info)
+    assert "动作列可以逐人改" in text
+    assert "保留在一线人员" in text and "移动到副主任表格" in text
     values = {metric.label: metric.value for metric in app.metric}
-    assert values["保留并更新"] == "1"
-    assert values["移到副主任表"] == "15"
+    assert values["保留在一线人员"] == "1"
+    assert values["移动到副主任表格"] == "15"
+    labels = [button.label for button in app.button]
+    assert "全部改为「保留在一线人员」" in labels
+    assert "全部改为「移动到副主任表格」" in labels
+    assert "恢复自动判定" in labels
+
+
+def test_pending_delete_action_override_reaches_the_export(app):
+    """把全部人改成"保留在一线人员"后，导出里就不该再有"移到副主任表"。"""
+    next(b for b in app.button if b.label == "全部改为「保留在一线人员」").click().run()
+    assert not app.exception, [e.value for e in app.exception]
+    values = {metric.label: metric.value for metric in app.metric}
+    assert values["保留在一线人员"] == "16"
+    assert values["移动到副主任表格"] == "0"
+    markdown = " ".join(block.value for block in app.markdown)
+    assert "按清单更新 **16** 人" in markdown
+    assert "移到副主任表" not in markdown.split("将新增")[1].split("将新增")[0]
+
+    next(b for b in app.button if b.label == "恢复自动判定").click().run()
+    values = {metric.label: metric.value for metric in app.metric}
+    assert values["移动到副主任表格"] == "15"
+
+
+def test_choice_labels_spell_out_the_action(app):
+    """按钮/勾选框不能只写"应用/取消"，要写清楚是新增还是删除。"""
+    labels = [button.label for button in app.button]
+    assert "全部新增到一线人员" in labels
+    assert "全部不新增" in labels
+    assert "全部从一线人员删除" in labels
+    assert "全部保留在一线人员" in labels
+    assert "全部应用" not in labels
+    assert "全部取消" not in labels
 
 
 def test_turning_interns_off_shrinks_the_target_list(app):

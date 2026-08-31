@@ -307,21 +307,27 @@ def test_new_rows_are_green_and_removed_rows_red(marked):
     data, _, adds, removes = marked
     workbook = openpyxl.load_workbook(io.BytesIO(data))
     sheet = workbook[SHEET]
-    add_keys = {(i.name, i.eid) for i in adds}
+    add_map = {(i.name, i.eid): i for i in adds}
     remove_keys = {(i.name, i.eid) for i in removes}
-    greens = reds = 0
+    greens = yellows = reds = 0
     for row in range(3, sheet.max_row + 1):
         name_cell = sheet.cell(row, 3)
         eid_cell = sheet.cell(row, 4)
         key = (str(name_cell.value or ""), str(eid_cell.value or ""))
         colors = {name_cell.fill.fgColor.rgb, eid_cell.fill.fgColor.rgb}
-        if key in add_keys:
-            assert colors == {"FF92D050"}, key
-            greens += 1
+        item = add_map.get(key)
+        if item is not None:
+            if item.is_intern:
+                assert colors == {"FFFFFF00"}, key  # 实习生走黄底
+                yellows += 1
+            else:
+                assert colors == {"FF92D050"}, key
+                greens += 1
         elif key in remove_keys or _strip(key) in remove_keys:
             assert colors == {"FFFF0000"}, key
             reds += 1
-    assert greens == len(adds)
+    assert greens + yellows == len(adds)
+    assert yellows == sum(1 for i in adds if i.is_intern)
     assert reds == len(removes)
 
 

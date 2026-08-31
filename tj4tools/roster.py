@@ -66,6 +66,56 @@ def is_target_duty(value) -> bool:
 # --------------------------------------------------------------------------- #
 
 
+def duty_rank_order(duty_order: dict[str, list[str]]) -> list[str]:
+    """从各车间块的职务排列反推一套"标准职务顺序"。
+
+    取每个职务在各块里的平均相对位置排序。示例文件的一线人员是
+    工程师 → 班长 → 助工 → 操作工；副主任表是 副主任 → 工艺组长 → 工程师 → 助工 → 操作工。
+    """
+    scores: dict[str, list[float]] = {}
+    for duties in duty_order.values():
+        span = max(1, len(duties) - 1)
+        for index, duty in enumerate(duties):
+            scores.setdefault(duty, []).append(index / span)
+    return sorted(scores, key=lambda duty: sum(scores[duty]) / len(scores[duty]))
+
+
+def resolve_anchor(layout, workshop: str, duty: str, *, allow_before_block: bool) -> tuple[int, str]:
+    """算出"把这个职务的人插到这个车间的哪一行之后"。
+
+    优先级：
+      1. 该车间已有这个职务 → 插在该职务最下面（``职务``）
+      2. 该车间没有这个职务 → 按标准职务顺序，插在排在它前面的最后一个职务之后（``职务顺序``）。
+         这一条是关键：否则新增的工程师会被扔到车间块最末尾、排在操作工后面。
+      3. 它按顺序应排在本块最前面 → 块首（``块首``）
+      4. 连车间块都没有 → 全表末尾（``表尾``）
+    """
+    canon = canon_duty(duty)
+    anchor = layout.duty_anchors.get((workshop, canon))
+    if anchor is not None:
+        return anchor, "职务"
+    block = layout.block_of(workshop)
+    if block is None:
+        return layout.last_data_row, "表尾"
+    _, start, end = block
+    order = layout.duty_rank_order
+    if canon not in order:
+        return end, "车间"
+    target = order.index(canon)
+    best: int | None = None
+    for present in layout.duty_order.get(workshop, []):
+        if present not in order or order.index(present) >= target:
+            continue
+        row = layout.duty_anchors.get((workshop, present))
+        if row is not None and (best is None or row > best):
+            best = row
+    if best is not None:
+        return best, "职务顺序"
+    # 该职务应排在本块最前面。车间列不合并的表可以插到块首之前；
+    # 合并的表（一线人员）不行——插在上一块末尾会被上一块的合并区吞掉。
+    return (start - 1 if allow_before_block else start), "块首"
+
+
 def find_sheet(workbook, *candidates: str):
     """按名字精确/模糊定位工作表。"""
     titles = {clean_text(ws.title): ws for ws in workbook.worksheets}
@@ -149,6 +199,7 @@ class SheetLayout:
     # 规范化后的车间名 -> 单元格里的原始文本。匹配用规范化名，写回必须用原文，
     # 否则「生产技术转移组（多肽）」会被写成半角括号，Excel 里就成了两个不同的车间。
     raw_names: dict[str, str] = field(default_factory=dict)
+    duty_rank_order: list[str] = field(default_factory=list)
 
     @property
     def workshops(self) -> list[str]:
@@ -164,14 +215,8 @@ class SheetLayout:
         return None
 
     def anchor_for(self, workshop: str, duty: str) -> tuple[int, str]:
-        """返回 (插入锚点行, 定位精度)：职务段末 / 车间块末 / 全表末。"""
-        anchor = self.duty_anchors.get((workshop, canon_duty(duty)))
-        if anchor is not None:
-            return anchor, "职务"
-        block = self.block_of(workshop)
-        if block is not None:
-            return block[2], "车间"
-        return self.last_data_row, "表尾"
+        """返回 (插入锚点行, 定位精度)。"""
+        return resolve_anchor(self, workshop, duty, allow_before_block=not self.merged_workshop)
 
 
 @dataclass
@@ -205,6 +250,8 @@ class BonusFile:
     notes: list[str] = field(default_factory=list)
     duty_anchors: dict[tuple[str, str], int] = field(default_factory=dict)
     duty_order: dict[str, list[str]] = field(default_factory=dict)
+    duty_rank_order: list[str] = field(default_factory=list)
+    merged_workshop: bool = True
 
     def block_of(self, workshop: str) -> tuple[str, int, int] | None:
         for block in self.blocks:
@@ -217,15 +264,15 @@ class BonusFile:
         return [block[0] for block in self.blocks]
 
     def anchor_for(self, workshop: str, duty: str) -> tuple[int | None, bool]:
-        """返回 (插入锚点行, 是否按职务精确定位)。
+        """返回 (插入锚点行, 是否按职务定位)。
 
-        锚点是该车间块里这个职务最下面的一行；该车间没有这个职务时退回块末尾。
+        该车间没有这个职务时，按标准职务顺序插到排在它前面的最后一个职务之后，
+        而不是一律扔到车间块末尾。
         """
-        anchor = self.duty_anchors.get((workshop, canon_duty(duty)))
-        if anchor is not None:
-            return anchor, True
-        block = self.block_of(workshop)
-        return (block[2] if block else None), False
+        if self.block_of(workshop) is None:
+            return (None, False)
+        anchor, precision = resolve_anchor(self, workshop, duty, allow_before_block=False)
+        return anchor, precision in ("职务", "职务顺序", "块首")
 
 
 # --------------------------------------------------------------------------- #
@@ -560,6 +607,7 @@ def _build_duty_anchors(result: BonusFile) -> None:
                 f"「{workshop}」里 {'、'.join(split)} 被其他职务隔成多段，"
                 "新增人员会插到人数最多的那一段末尾"
             )
+    result.duty_rank_order = duty_rank_order(result.duty_order)
 
 
 def _parse_others(sheet) -> SheetLayout:
@@ -643,6 +691,7 @@ def _fill_duty_anchors(layout: SheetLayout) -> None:
             if duty not in seen:
                 seen.append(duty)
         layout.duty_order[workshop] = seen
+    layout.duty_rank_order = duty_rank_order(layout.duty_order)
 
 
 # --------------------------------------------------------------------------- #
@@ -850,6 +899,7 @@ class Reconciliation:
     only_roster: int = 0
     only_bonus: int = 0
     excluded_in_others: int = 0
+    excluded_late_interns: int = 0
     paired_renames: int = 0
     notes: list[str] = field(default_factory=list)
     unmapped_groups: list[tuple[str, int]] = field(default_factory=list)
@@ -1004,6 +1054,18 @@ def classify_intern(item: DiffItem, asof: _dt.date | None, months: int) -> None:
     _classify_intern(item, asof, months)
 
 
+def intern_is_countable(person: Person, asof: _dt.date | None) -> bool:
+    """实习生只有在**判断日期之前**入职才纳入表格；之后入职的不加。
+
+    非实习生不受这条限制。
+    """
+    if not person.is_intern:
+        return True
+    if asof is None:
+        return True
+    return person.hire_date is not None and person.hire_date < asof
+
+
 def _classify_intern(item: DiffItem, asof: _dt.date | None, months: int) -> None:
     """按判断日期把实习生分成"入职超过 N 个月"和"入职不到 N 个月"。"""
     if not item.is_intern:
@@ -1090,6 +1152,7 @@ def reconcile(
 
     items: list[DiffItem] = []
     excluded = 0
+    late_interns = 0
 
     # --- 清单有、核算无 ------------------------------------------------- #
     for key in sorted(roster_keys - bonus_keys, key=lambda k: (roster.production[k].group, k)):
@@ -1097,6 +1160,10 @@ def reconcile(
         flags: list[str] = []
         if exclude_in_others and key in bonus.others:
             excluded += 1
+            continue
+        if not intern_is_countable(person, intern_asof):
+            # 判断日期之后入职的实习生不加入表格
+            late_interns += 1
             continue
         if key in bonus.others:
             flags.append(f"已在「{SHEET_OTHERS}」子表")
@@ -1201,6 +1268,10 @@ def reconcile(
         notes.append(
             f"有 {paired} 人在两表里编号相同、姓名不同，已合并为「按清单更新姓名」，不再重复新增"
         )
+    if late_interns:
+        notes.append(
+            f"有 {late_interns} 名实习生在判断日期 {intern_asof} 之后入职，按规则不加入表格"
+        )
     pending = Counter(
         item.group
         for item in items
@@ -1219,6 +1290,7 @@ def reconcile(
         only_roster=len(roster_keys - bonus_keys),
         only_bonus=len(bonus_keys - roster_keys),
         excluded_in_others=excluded,
+        excluded_late_interns=late_interns,
         paired_renames=paired,
         notes=notes,
         unmapped_groups=unmapped,
