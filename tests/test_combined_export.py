@@ -101,13 +101,13 @@ def test_combined_apply_changes_both_sheets(combined, bonus):
         for item in payload["supervisor_adds"]
         if item.key not in move_keys and (item.target_workshop or item.workshop)
     ]
-    # 带括号分组不自动落车间后：一线 228 增 / 41 删 / 15 移；副主任表去重后新增 5、删除 11
+    # 一线 228 增 / 41 删 / 15 移；转移组等改走副主任表后，去重新增 16、删除 11
     assert summary.added == len(payload["frontline_adds"]) == 228
     assert summary.removed == len(payload["frontline_removes"]) == 41
     assert summary.moved == 15
     assert summary.updated == 1
     assert summary.other_removed == 11
-    assert summary.other_added == len(unique_supervisor) == 5
+    assert summary.other_added == len(unique_supervisor) == 16
     assert frontline.max_row == 676 + summary.added - summary.removed - summary.moved
     assert others.max_row == 206 + summary.moved + summary.other_added - summary.other_removed
 
@@ -165,8 +165,8 @@ def test_combined_keeps_other_sheets_and_parts(bonus_bytes, combined):
 def test_combined_lookup_reference_follows_net_delta(bonus_bytes, combined):
     data, _, _ = combined
     sheet = openpyxl.load_workbook(io.BytesIO(data), data_only=False)[OTHERS]
-    # 15 移入 + 5 副主任新增 - 11 删除 = +9，不能用 summary 反推，否则摘要错了公式也会过
-    assert sheet["L2"].value == "=HLOOKUP(M2,$A$152:$H$153,2)"
+    # 15 移入 + 16 副主任新增 - 11 删除 = +20，不能用 summary 反推，否则摘要错了公式也会过
+    assert sheet["L2"].value == "=HLOOKUP(M2,$A$163:$H$164,2)"
 
 
 def test_combined_others_workshop_blocks_stay_contiguous(combined):
@@ -184,6 +184,6 @@ def test_combined_summary_mentions_both_sheets(combined):
     text = combined[1].text()
     assert "直接插入 228 人（红字）" in text
     assert "直接删除 41 人" in text
-    assert "副主任表直接插入 5 人（红字）" in text
+    assert "副主任表直接插入 16 人（红字）" in text
     assert "副主任表直接删除 11 人" in text
     assert "移到「副主任&工艺组长及其他」15 人" in text

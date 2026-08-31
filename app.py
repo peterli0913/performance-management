@@ -31,6 +31,7 @@ from tj4tools.roster import (
     CATEGORY_NEW,
     CATEGORY_PENDING_ADD,
     CATEGORY_PENDING_DEL,
+    ROUTE_TO_OTHERS,
     SHEET_FRONTLINE,
     SHEET_OTHERS,
     build_others_workshop_map,
@@ -39,6 +40,8 @@ from tj4tools.roster import (
     parse_roster,
     placeable_keys,
     reconcile,
+    resolved_group_workshop,
+    resolved_workshop,
 )
 from tj4tools.search import (
     infer_fields,
@@ -49,6 +52,7 @@ from tj4tools.search import (
 from tj4tools.supervisor import (
     MANAGEMENT_TITLES,
     SCOPE_STRICT,
+    as_supervisor_adds,
     build_duty_map,
     describe_duty_map,
     reconcile_supervisors,
@@ -57,6 +61,7 @@ from tj4tools.supervisor_export import build_supervisor_workbook
 from tj4tools.supervisor_export import split_by_action as sup_split_by_action
 
 NEW_BLOCK_PREFIX = "＋新建车间块："
+TO_OTHERS_OPTION = "→ 副主任&工艺组长及其他"
 UNSET = "（未指定）"
 UNDECIDED, APPLY, CANCEL = "待定", "应用", "取消"
 PAGE_SIZE = 20
@@ -147,7 +152,10 @@ def resolved_placeable(review: "Review", analysis) -> frozenset:
     for item in analysis.items:
         if item.action != "add":
             continue
-        if to_workshop(effective_workshop(review, item, analysis.mapping)):
+        workshop = to_workshop(effective_workshop(review, item, analysis.mapping))
+        if workshop == ROUTE_TO_OTHERS:
+            keys.discard(item.key)
+        elif workshop:
             keys.add(item.key)
     for placement in current_placements():
         if placement.target_sheet == SHEET_FRONTLINE:
@@ -325,6 +333,8 @@ def to_workshop(value: str) -> str:
     """把界面上的选项值还原成真正的车间名。"""
     if not value or value == UNSET:
         return ""
+    if value in (TO_OTHERS_OPTION, ROUTE_TO_OTHERS):
+        return ROUTE_TO_OTHERS
     return value[len(NEW_BLOCK_PREFIX) :] if value.startswith(NEW_BLOCK_PREFIX) else value
 
 
@@ -332,27 +342,27 @@ def to_option(value: str, options: list[str]) -> str:
     """把车间名转成下拉里合法的选项值。"""
     if not value:
         return UNSET
+    if value == ROUTE_TO_OTHERS:
+        return TO_OTHERS_OPTION
     return value if value in options else NEW_BLOCK_PREFIX + value
 
 
 def build_options(workshops, groups) -> list[str]:
-    """下拉选项 = 未指定 + 原有车间 + 「新建车间块」候选。"""
+    """下拉选项 = 未指定 + 改走副主任表 + 原有车间 + 「新建车间块」候选。"""
     return (
-        [UNSET]
+        [UNSET, TO_OTHERS_OPTION]
         + list(workshops)
         + [NEW_BLOCK_PREFIX + name for name in sorted({g for g in groups if g})]
     )
 
 
 def effective_workshop(review: Review, item, mapping) -> str:
-    if item.label in review.workshop_override:
-        return review.workshop_override[item.label]
-    if item.group in review.mapping_override:
-        return review.mapping_override[item.group]
-    guess = mapping.get(item.group)
-    if guess is not None:
-        return guess.workshop if hasattr(guess, "workshop") else str(guess)
-    return item.target_workshop or item.workshop
+    return resolved_workshop(
+        item,
+        mapping,
+        person_overrides=review.workshop_override,
+        group_overrides=review.mapping_override,
+    )
 
 
 def describe_guess(guess) -> str:
@@ -360,6 +370,8 @@ def describe_guess(guess) -> str:
         return "需人工指定"
     if isinstance(guess, str):
         return guess or "需人工指定"
+    if guess.route_others:
+        return f"副主任表已有「{guess.group}」车间，建议放副主任表"
     hint = guess.suggested or guess.workshop
     if guess.needs_manual:
         if not hint:
@@ -422,12 +434,7 @@ def render_mapping_editor(review: Review, mapping, items, options, hint: str) ->
 
 
 def effective_group_workshop(review: Review, group: str, mapping) -> str:
-    if group in review.mapping_override:
-        return review.mapping_override[group]
-    guess = mapping.get(group)
-    if guess is None:
-        return ""
-    return guess if isinstance(guess, str) else guess.workshop
+    return resolved_group_workshop(group, mapping, review.mapping_override)
 
 
 # --------------------------------------------------------------------------- #
@@ -770,7 +777,10 @@ def collect_frontline_items(
     skip = exclude_keys or set()
 
     def resolved(item):
-        item.workshop = to_workshop(effective_workshop(review, item, analysis.mapping))
+        workshop = to_workshop(effective_workshop(review, item, analysis.mapping))
+        if workshop == ROUTE_TO_OTHERS:
+            return None
+        item.workshop = workshop
         return item
 
     selectable = [
@@ -788,18 +798,50 @@ def collect_frontline_items(
             continue
         action = effective_pending_action(review, item)
         item.action = "move" if action == ACTION_TO_OTHERS else "update"
-        auto.append(resolved(item))
+        kept = resolved(item)
+        if kept is not None:
+            auto.append(kept)
     reviewed = [i for i in selectable if i.category != CATEGORY_PENDING_DEL]
-    chosen = [
-        resolved(item)
-        for item in reviewed
-        if (review.decisions.get(item.label) == APPLY)
-        or (not approved_only and review.decisions.get(item.label) != CANCEL)
-    ]
+    chosen = []
+    for item in reviewed:
+        if (review.decisions.get(item.label) == APPLY) or (
+            not approved_only and review.decisions.get(item.label) != CANCEL
+        ):
+            kept = resolved(item)
+            if kept is not None:
+                chosen.append(kept)
     return split_by_action(auto + chosen + list(extra or []))
 
 
-def render_export(review: Review, bonus_bytes, bonus, analysis, include_pending) -> None:
+def collect_routed_add_items(
+    review: Review,
+    analysis,
+    include_pending,
+    *,
+    approved_only: bool,
+    exclude_keys=None,
+):
+    """一线映射里改走副主任表的新增人，供功能一单独导出时写入副主任表。"""
+    skip = exclude_keys or set()
+    out = []
+    for item in analysis.items:
+        if item.key in skip or item.action != "add":
+            continue
+        if not (
+            item.category in (CATEGORY_NEW, CATEGORY_LEFT)
+            or include_pending.get(item.category, True)
+        ):
+            continue
+        if review.decisions.get(item.label) == CANCEL:
+            continue
+        if approved_only and review.decisions.get(item.label) != APPLY:
+            continue
+        if to_workshop(effective_workshop(review, item, analysis.mapping)) == ROUTE_TO_OTHERS:
+            out.append(item)
+    return out
+
+
+def render_export(review: Review, bonus_bytes, bonus, analysis, include_pending, roster=None) -> None:
     extra_fl, extra_sup, exclude = search_bundle(bonus)
     kept = collect_frontline_items(
         review, analysis, include_pending, approved_only=False, extra=extra_fl, exclude_keys=exclude
@@ -808,6 +850,31 @@ def render_export(review: Review, bonus_bytes, bonus, analysis, include_pending)
         review, analysis, include_pending, approved_only=True, extra=extra_fl, exclude_keys=exclude
     )
     other_adds, other_removes = sup_split_by_action(extra_sup)
+    routed_kept = []
+    routed_approved = []
+    if roster is not None:
+        duty_map = build_duty_map(roster, bonus)
+        others_map = build_others_workshop_map(roster, bonus)
+        routed_kept = as_supervisor_adds(
+            collect_routed_add_items(
+                review, analysis, include_pending, approved_only=False, exclude_keys=exclude
+            ),
+            analysis.mapping,
+            duty_map,
+            others_map,
+            group_overrides=review.mapping_override,
+            person_overrides=review.workshop_override,
+        )
+        routed_approved = as_supervisor_adds(
+            collect_routed_add_items(
+                review, analysis, include_pending, approved_only=True, exclude_keys=exclude
+            ),
+            analysis.mapping,
+            duty_map,
+            others_map,
+            group_overrides=review.mapping_override,
+            person_overrides=review.workshop_override,
+        )
 
     left, right = st.columns(2)
     with left:
@@ -821,11 +888,13 @@ def render_export(review: Review, bonus_bytes, bonus, analysis, include_pending)
         if extra_fl or extra_sup:
             st.caption(f"含检索投放 {len(current_placements())} 人，将随本次导出写入。")
         preview_counts(adds, removes, updates, moves, "标记删除")
+        if routed_kept:
+            st.caption(f"另有 {len(routed_kept)} 人按车间映射写入副主任表（不在一线新建车间块）。")
         if st.button("生成对照标记版", type="primary", width="stretch",
                      key=review.widget("gen_mark")):
             generate(
                 review, "mark", bonus_bytes, bonus, adds, removes, updates, moves,
-                other_adds=other_adds, other_removes=other_removes,
+                other_adds=list(other_adds) + routed_kept, other_removes=other_removes,
             )
         offer_download(review, "mark", bonus.file_name, "对照标记版")
 
@@ -837,11 +906,13 @@ def render_export(review: Review, bonus_bytes, bonus, analysis, include_pending)
         )
         adds, removes, updates, moves = approved
         preview_counts(adds, removes, updates, moves, "直接删除")
+        if routed_approved:
+            st.caption(f"另有 {len(routed_approved)} 人按车间映射写入副主任表（不在一线新建车间块）。")
         if st.button("生成已应用版", type="primary", width="stretch",
                      key=review.widget("gen_apply")):
             generate(
                 review, "apply", bonus_bytes, bonus, adds, removes, updates, moves,
-                other_adds=other_adds, other_removes=other_removes,
+                other_adds=list(other_adds) + routed_approved, other_removes=other_removes,
             )
         offer_download(review, "apply", bonus.file_name, "已应用版")
 
@@ -1157,7 +1228,7 @@ def main() -> None:
     elif feature == FEATURE_SEARCH:
         render_search_feature(payload, result, bonus, options_)
     else:
-        render_frontline_feature(payload, result, bonus, analysis, options_)
+        render_frontline_feature(payload, result, roster, bonus, analysis, options_)
 
 
 def _upsert_placement(row: dict) -> None:
@@ -1341,7 +1412,7 @@ def render_search_feature(payload, result, bonus, options_) -> None:
     render_database(payload, result)
 
 
-def render_frontline_feature(payload, result, bonus, analysis, options_) -> None:
+def render_frontline_feature(payload, result, roster, bonus, analysis, options_) -> None:
     review = Review("")
     bonus_name = options_["bonus_name"]
     include_pending = options_["include_pending"]
@@ -1388,7 +1459,9 @@ def render_frontline_feature(payload, result, bonus, analysis, options_) -> None
         options,
         "「自动建议」由两表已匹配人员反推得出。置信度低、带括号或显示「需人工指定」的行请在右侧下拉里选择；"
         "目前分组带括号的（委培、分区等）一律不自动落车间，必须手选。"
-        "选「＋新建车间块」会在一线人员子表最下方新建该分组。",
+        "选「＋新建车间块」会在一线人员子表最下方新建该分组。"
+        "副主任表已有的分组（13号楼、生产技术转移组等）请选「→ 副主任&工艺组长及其他」，"
+        "不要新建一线车间块。",
     )
 
     tabs = st.tabs(
@@ -1415,7 +1488,9 @@ def render_frontline_feature(payload, result, bonus, analysis, options_) -> None
                     category in ADD_CATEGORIES,
                 )
     with tabs[4]:
-        render_export(review, result.raw_files[bonus_name], bonus, analysis, include_pending)
+        render_export(
+            review, result.raw_files[bonus_name], bonus, analysis, include_pending, roster
+        )
     with tabs[5]:
         render_database(payload, result)
 

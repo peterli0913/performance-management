@@ -12,6 +12,9 @@ from tj4tools.roster import (
     CATEGORY_NEW,
     CATEGORY_PENDING_ADD,
     CATEGORY_PENDING_DEL,
+    SHEET_OTHERS,
+    build_others_workshop_map,
+    build_workshop_mapping,
     reconcile,
 )
 from tj4tools.supervisor import (
@@ -44,6 +47,95 @@ def strict(roster_with_interns, bonus, placeable):
     return reconcile_supervisors(
         roster_with_interns, bonus, scope=SCOPE_STRICT, placeable_keys=placeable
     )
+
+
+def test_others_map_keeps_existing_block_for_same_named_group(roster_with_interns, bonus):
+    """分组名本身就是副主任表已有车间时，不必再手选；委培分组仍扣住。"""
+    others_map = build_others_workshop_map(roster_with_interns, bonus)
+    peptide = others_map["生产技术转移组(多肽)"]
+    assert peptide.workshop == "生产技术转移组(多肽)"
+    assert not peptide.needs_manual
+    assert others_map["13号楼"].workshop == "13号楼"
+    trainee = others_map["13号楼(12号楼委培)"]
+    assert trainee.workshop == ""
+    assert trainee.needs_manual
+    assert trainee.suggested == "13号楼"
+
+
+def test_as_supervisor_adds_routes_transfer_group(roster_with_interns, bonus):
+    from tj4tools.supervisor import as_supervisor_adds
+
+    mapping = build_workshop_mapping(roster_with_interns, bonus)
+    result = reconcile(roster_with_interns, bonus, mapping=mapping)
+    adds = as_supervisor_adds(
+        result.items,
+        mapping,
+        build_duty_map(roster_with_interns, bonus),
+        build_others_workshop_map(roster_with_interns, bonus),
+    )
+    zhang = next(i for i in adds if i.eid == "ALS18013")
+    assert zhang.target_sheet == SHEET_OTHERS
+    assert zhang.target_workshop == "生产技术转移组(多肽)"
+    assert zhang.duty == "助理工程师"
+    assert zhang.action == "add"
+    assert zhang.name == "张伟超"
+    assert not any(i.eid == "ALS18013" and i.workshop for i in result.items)
+
+
+def test_manual_13_override_goes_to_others(roster_with_interns, bonus):
+    from tj4tools.roster import ROUTE_TO_OTHERS
+    from tj4tools.supervisor import as_supervisor_adds
+
+    mapping = build_workshop_mapping(roster_with_interns, bonus)
+    result = reconcile(roster_with_interns, bonus, mapping=mapping)
+    source = next(i for i in result.items if i.action == "add" and i.group == "13号楼")
+    adds = as_supervisor_adds(
+        result.items,
+        mapping,
+        build_duty_map(roster_with_interns, bonus),
+        build_others_workshop_map(roster_with_interns, bonus),
+        group_overrides={"13号楼": ROUTE_TO_OTHERS},
+    )
+    routed = next(i for i in adds if i.eid == source.eid)
+    assert routed.target_sheet == SHEET_OTHERS
+    assert routed.target_workshop == "13号楼"
+
+
+def test_zhang_weichao_exports_to_others_not_frontline(bonus_bytes, bonus, roster_with_interns):
+    """张伟超默认进副主任表「生产技术转移组（多肽）」，一线不得新建同名车间块。"""
+    from tj4tools.bonus_export import build_workbook
+    from tj4tools.supervisor import as_supervisor_adds
+
+    mapping = build_workshop_mapping(roster_with_interns, bonus)
+    result = reconcile(roster_with_interns, bonus, mapping=mapping)
+    fl_adds = [
+        item
+        for item in result.items
+        if item.action == "add" and item.workshop and not mapping[item.group].route_others
+    ]
+    other_adds = as_supervisor_adds(
+        result.items,
+        mapping,
+        build_duty_map(roster_with_interns, bonus),
+        build_others_workshop_map(roster_with_interns, bonus),
+    )
+    data, summary = build_workbook(
+        bonus_bytes, bonus, fl_adds, [], [], [], mode="apply", other_adds=other_adds
+    )
+    workbook = openpyxl.load_workbook(io.BytesIO(data))
+    frontline = {
+        str(workbook[FRONTLINE].cell(row, 4).value or "")
+        for row in range(3, workbook[FRONTLINE].max_row + 1)
+    }
+    others_hits = [
+        str(workbook[SHEET].cell(row, 1).value or "")
+        for row in range(2, workbook[SHEET].max_row + 1)
+        if str(workbook[SHEET].cell(row, 4).value or "") == "ALS18013"
+    ]
+    assert "ALS18013" not in frontline
+    assert others_hits == ["生产技术转移组（多肽）"]
+    assert "生产技术转移组(多肽)" not in summary.new_blocks
+    assert "生产技术转移组（多肽）" not in summary.new_blocks
 
 
 def test_duty_map_is_derived_from_matched_people(roster_with_interns, bonus):
@@ -140,11 +232,12 @@ def test_removes_explain_why_they_are_out_of_scope(strict):
 def test_unmapped_groups_are_reported(strict):
     """只给出数据，提示语交给界面按"当前生效的映射"实时算，避免人工指定完文案还挂着。"""
     assert strict.unmapped_groups
-    assert sum(count for _, count in strict.unmapped_groups) == 24
+    assert sum(count for _, count in strict.unmapped_groups) == 13
     assert not any("没有对应车间" in note for note in strict.notes)
     unmapped = [i for i in strict.items if i.action == "add" and not i.workshop]
-    assert len(unmapped) == 24
-    assert any(i.group.startswith("生产技术转移组") for i in unmapped)
+    assert len(unmapped) == 13
+    assert not any(i.group == "生产技术转移组(多肽)" for i in unmapped)
+    assert any(i.group == "生产技术转移组(核酸)" for i in unmapped)
     assert all(any("没有对应车间" in flag for flag in i.flags) for i in unmapped)
 
 

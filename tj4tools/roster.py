@@ -48,6 +48,8 @@ SHEET_DEPARTURE = "离职人员&调出人员"
 SHEET_CHANGES = "人员变动说明"
 SHEET_FRONTLINE = "一线人员"
 SHEET_OTHERS = "副主任&工艺组长及其他"
+# 车间映射里「放到副主任表」的哨兵，不能当一线新建车间块的名字
+ROUTE_TO_OTHERS = "__副主任表__"
 
 NEW_BLOCK_SENTINEL = "__新增车间__"
 
@@ -709,6 +711,7 @@ class WorkshopGuess:
     headcount: int = 0
     suggested: str = ""
     needs_manual: bool = False
+    route_others: bool = False
 
     @property
     def confidence(self) -> str:
@@ -751,10 +754,12 @@ def placeable_keys(analysis) -> set[tuple[str, str]]:
     for item in analysis.items:
         if item.action != "add":
             continue
+        guess = mapping.get(item.group)
+        if guess is not None and guess.route_others:
+            continue
         if item.workshop:
             keys.add(item.key)
             continue
-        guess = mapping.get(item.group)
         if guess is not None and guess.needs_manual and guess.suggested:
             keys.add(item.key)
     return keys
@@ -795,9 +800,13 @@ def build_workshop_mapping(roster: RosterFile, bonus: BonusFile) -> dict[str, Wo
             headcount=headcount.get(group, 0),
         )
     withhold_parenthetical(mapping)
+    others_names = set(bonus.others_layout.workshops) if bonus.others_layout else set()
     for guess in mapping.values():
         if group_needs_manual(guess.group) and not guess.workshop:
             guess.needs_manual = True
+        # 一线没有现成车间（或带括号还没落）、副主任表已有同名车间 → 默认放副主任表
+        if guess.group in others_names and (not guess.workshop or guess.needs_manual):
+            guess.route_others = True
     return dict(sorted(mapping.items(), key=lambda item: -item[1].headcount))
 
 
@@ -924,6 +933,45 @@ class DiffItem:
             "提示": "；".join(self.flags),
             "_key": self.label,
         }
+
+
+def resolved_group_workshop(
+    group: str,
+    mapping: dict,
+    group_overrides: dict[str, str] | None = None,
+) -> str:
+    """分组落到哪个车间：人工覆盖 > 默认改走副主任表 > 一线推断。"""
+    if group_overrides and group in group_overrides:
+        return group_overrides[group]
+    guess = mapping.get(group) if mapping else None
+    if guess is None:
+        return ""
+    if isinstance(guess, str):
+        return guess
+    if guess.route_others:
+        return ROUTE_TO_OTHERS
+    return guess.workshop
+
+
+def resolved_workshop(
+    item: DiffItem,
+    mapping: dict,
+    *,
+    person_overrides: dict[str, str] | None = None,
+    group_overrides: dict[str, str] | None = None,
+) -> str:
+    if person_overrides and item.label in person_overrides:
+        return person_overrides[item.label]
+    if group_overrides and item.group in group_overrides:
+        return group_overrides[item.group]
+    guess = mapping.get(item.group) if mapping else None
+    if guess is None:
+        return item.target_workshop or item.workshop
+    if isinstance(guess, str):
+        return guess
+    if guess.route_others:
+        return ROUTE_TO_OTHERS
+    return guess.workshop
 
 
 @dataclass
@@ -1153,6 +1201,17 @@ def build_others_workshop_map(roster: RosterFile, bonus: BonusFile) -> dict[str,
     for guess in mapping.values():
         if group_needs_manual(guess.group) and not guess.workshop:
             guess.needs_manual = True
+    known = set(layout.workshops)
+    roster_groups = {person.group for person in roster.production_all.values() if person.group}
+    for group in roster_groups:
+        if group not in known:
+            continue
+        current = mapping.get(group)
+        if current is None:
+            mapping[group] = WorkshopGuess(group=group, workshop=group, source="规则")
+        elif not current.workshop:
+            current.workshop = current.suggested or group
+            current.needs_manual = False
     return mapping
 
 

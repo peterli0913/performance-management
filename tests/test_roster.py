@@ -274,6 +274,36 @@ def test_parenthetical_groups_are_held_for_manual_review(roster, bonus):
     assert any(i.group.startswith("生产技术转移组") and i.key not in keys for i in held)
 
 
+def test_groups_already_on_others_sheet_default_to_others(roster, bonus):
+    """一线没有现成车间、副主任表已有同名车间的分组，默认放副主任表。
+
+    截图红框里的「生产技术转移组(多肽)」「生产技术转移组(辅料&毒素连接体)」就是这类；
+    「13号楼」一线已有经验映射到 12号楼，不自动改口，留给手选。
+    """
+    mapping = build_workshop_mapping(roster, bonus)
+    peptide = mapping["生产技术转移组(多肽)"]
+    linker = mapping["生产技术转移组(辅料&毒素连接体)"]
+    building13 = mapping["13号楼"]
+    trainee = mapping["13号楼(12号楼委培)"]
+    nucleic = mapping["生产技术转移组(核酸)"]
+
+    assert peptide.route_others
+    assert linker.route_others
+    assert not building13.route_others
+    assert building13.workshop == "12号楼"
+    assert not trainee.route_others
+    assert not nucleic.route_others
+
+    result = reconcile(roster, bonus, mapping=mapping)
+    from tj4tools.roster import placeable_keys
+
+    keys = placeable_keys(result)
+    zhang = next(i for i in result.items if i.eid == "ALS18013")
+    assert zhang.group == "生产技术转移组(多肽)"
+    assert zhang.action == "add"
+    assert zhang.key not in keys
+
+
 def test_unmappable_groups_are_reported(result):
     unmapped = [item for item in result.items if item.action == "add" and not item.workshop]
     assert unmapped, "应当存在需要人工指定车间的人员"

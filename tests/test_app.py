@@ -51,7 +51,7 @@ def test_interns_are_included_and_counted(app):
 
 def test_unmapped_groups_are_summarised_not_dumped(app):
     warnings = [block.value for block in app.warning]
-    assert any("74 名待新增人员" in text for text in warnings)
+    assert any("63 名待新增人员" in text for text in warnings)
     # 长长的分组清单要收进折叠区，而不是塞在警告文字里
     assert all(len(text) < 120 for text in warnings), warnings
 
@@ -88,8 +88,9 @@ def test_generate_marked_workbook_end_to_end(app):
     assert "按清单更新 1 人" in success
     assert "移到「副主任&工艺组长及其他」15 人" in success
     assert "实习生" in success
-    # 带括号的分组不再自动落车间，加上原本对不上的，一并跳过
-    assert "跳过 74 人" in success
+    # 带括号的委培等仍跳过；副主任表已有同名车间的 11 人改写入副主任表
+    assert "跳过 63 人" in success
+    assert "副主任表新增 11 人" in success
 
 
 def test_window_date_change_reruns_and_shifts_the_split(app):
@@ -288,7 +289,7 @@ def test_supervisor_unmapped_warning_is_live(supervisor_app):
     warnings = [block.value for block in supervisor_app.warning]
     live = [text for text in warnings if "没有对应车间" in text]
     assert len(live) == 1, warnings
-    assert "还有 24 名待新增人员" in live[0]
+    assert "还有 13 名待新增人员" in live[0]
 
 
 def test_supervisor_generates_and_offers_download(supervisor_app):
@@ -405,7 +406,7 @@ def test_combined_generate_offers_one_download():
     assert "直接插入 228 人" in success
     assert "直接删除 41 人" in success
     assert "移到「副主任&工艺组长及其他」15 人" in success
-    assert "副主任表直接插入 5 人" in success
+    assert "副主任表直接插入 16 人" in success
     assert "副主任表直接删除 11 人" in success
     labels = [d.label for d in instance.get("download_button")]
     assert any("两表已应用版" in label for label in labels)
@@ -417,7 +418,8 @@ def test_preview_counts_match_generated_counts():
     markdown = " ".join(block.value for block in instance.markdown)
     assert "将新增 **228** 人" in markdown, markdown[-500:]
     captions = " ".join(block.value for block in instance.caption)
-    assert "另有 74 人未指定车间" in captions
+    assert "另有 63 人未指定车间" in captions
+    assert "另有 11 人按车间映射写入副主任表" in captions
     next(b for b in instance.button if b.label == "生成对照标记版").click().run()
     assert any("新增 228 人" in block.value for block in instance.success)
 
@@ -453,3 +455,13 @@ def test_search_by_name_shows_file_and_full_row():
     next(button for button in instance.button if button.label == "加入投放清单").click().run()
     assert not instance.exception, [e.value for e in instance.exception]
     assert any("投放清单（1）" in block.value for block in instance.subheader)
+
+
+def test_mapping_dropdown_offers_route_to_others():
+    import app as app_mod
+    from tj4tools.roster import ROUTE_TO_OTHERS
+
+    options = app_mod.build_options(["12号楼"], {"13号楼", "生产技术转移组(多肽)"})
+    assert app_mod.TO_OTHERS_OPTION in options
+    assert app_mod.to_workshop(app_mod.TO_OTHERS_OPTION) == ROUTE_TO_OTHERS
+    assert app_mod.to_option(ROUTE_TO_OTHERS, options) == app_mod.TO_OTHERS_OPTION

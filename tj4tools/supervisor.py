@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import datetime as _dt
 from collections import Counter, defaultdict
+from dataclasses import replace
 
 from .normalize import fmt_date
 from .roster import (
@@ -34,6 +35,7 @@ from .roster import (
     CATEGORY_NEW,
     CATEGORY_PENDING_ADD,
     CATEGORY_PENDING_DEL,
+    ROUTE_TO_OTHERS,
     SHEET_OTHERS,
     SHEET_PRODUCTION,
     BonusFile,
@@ -41,12 +43,14 @@ from .roster import (
     Person,
     Reconciliation,
     RosterFile,
+    WorkshopGuess,
     build_others_workshop_map,
     classify_intern,
     departure_evidence,
     intern_is_countable,
     months_before,
     new_hire_evidence,
+    resolved_workshop,
 )
 
 # 组一：管理类职务，不管在不在一线人员子表都归这张表
@@ -254,6 +258,59 @@ def target_summary(
             roster, bonus, scope=scope, placeable_keys=placeable_keys, intern_asof=intern_asof
         )
         out[scope] = len(target)
+    return out
+
+
+def _others_target_workshop(group: str, others_map: dict[str, WorkshopGuess]) -> str:
+    guess = others_map.get(group)
+    if guess is None:
+        return group
+    return guess.workshop or guess.suggested or group
+
+
+def as_supervisor_adds(
+    items: list[DiffItem],
+    mapping: dict,
+    duty_map: dict[str, str],
+    others_map: dict[str, WorkshopGuess],
+    *,
+    group_overrides: dict[str, str] | None = None,
+    person_overrides: dict[str, str] | None = None,
+) -> list[DiffItem]:
+    """把一线对账里改走副主任表的新增人，收成副主任表可插入的 DiffItem。"""
+    out: list[DiffItem] = []
+    for item in items:
+        if item.action != ACTION_ADD:
+            continue
+        if (
+            resolved_workshop(
+                item,
+                mapping,
+                person_overrides=person_overrides,
+                group_overrides=group_overrides,
+            )
+            != ROUTE_TO_OTHERS
+        ):
+            continue
+        duty = (
+            duty_map.get(item.duty_raw)
+            or duty_map.get(item.duty)
+            or DUTY_FALLBACK.get(item.duty)
+            or DUTY_FALLBACK.get(item.duty_raw)
+            or item.duty
+        )
+        target = _others_target_workshop(item.group, others_map)
+        out.append(
+            replace(
+                item,
+                action=ACTION_ADD,
+                duty=duty,
+                target_sheet=SHEET_OTHERS,
+                target_workshop=target,
+                workshop=target,
+                target_workshop_source="经验映射" if target else "",
+            )
+        )
     return out
 
 
