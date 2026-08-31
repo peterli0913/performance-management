@@ -6,7 +6,8 @@ import zipfile
 import openpyxl
 import pytest
 
-from tj4tools.bonus_export import build_combined_workbook, build_workbook
+from tj4tools.bonus_export import build_combined_workbook, build_workbook, merge_others_inserts
+from tj4tools.roster import ACTION_ADD, ACTION_MOVE, DiffItem
 from tj4tools.roster import reconcile
 from tj4tools.supervisor import SCOPE_STRICT, reconcile_supervisors
 
@@ -22,6 +23,32 @@ def pair(roster_with_interns, bonus):
         roster_with_interns, bonus, scope=SCOPE_STRICT, placeable_keys=placeable
     )
     return frontline, supervisor
+
+
+def _item(name, eid, action, duty="", workshop=""):
+    return DiffItem(
+        key=(name, eid),
+        name=name,
+        eid=eid,
+        category="测试",
+        duty=duty,
+        duty_raw=duty,
+        workshop=workshop,
+        action=action,
+        target_workshop=workshop,
+        new_values={"职务": duty} if action == ACTION_MOVE else {},
+    )
+
+
+def test_merge_others_inserts_prefers_supervisor_item_and_does_not_mutate():
+    move_only = _item("甲", "1", ACTION_MOVE, "清洗工", "清洗组")
+    extra_only = _item("乙", "2", ACTION_ADD, "助理工程师", "安全组")
+    move_overlap = _item("丙", "3", ACTION_MOVE, "车间副主任", "12号楼")
+    extra_overlap = _item("丙", "3", ACTION_ADD, "副主任", "")
+    merged = merge_others_inserts([move_only, move_overlap], [extra_only, extra_overlap])
+    assert merged == [move_only, extra_overlap, extra_only]
+    assert extra_overlap.target_workshop == ""
+    assert extra_overlap.workshop == ""
 
 
 def _payload(pair):
@@ -134,15 +161,27 @@ def test_combined_keeps_other_sheets_and_parts(bonus_bytes, combined):
 
 
 def test_combined_lookup_reference_follows_net_delta(bonus_bytes, combined):
-    data, summary, _ = combined
+    data, _, _ = combined
     sheet = openpyxl.load_workbook(io.BytesIO(data), data_only=False)[OTHERS]
-    delta = summary.moved + summary.other_added - summary.other_removed
-    assert sheet["L2"].value == f"=HLOOKUP(M2,$A${143 + delta}:$H${144 + delta},2)"
+    # 15 移入 + 15 副主任新增 - 11 删除 = +19，不能用 summary 反推，否则摘要错了公式也会过
+    assert sheet["L2"].value == "=HLOOKUP(M2,$A$162:$H$163,2)"
+
+
+def test_combined_others_workshop_blocks_stay_contiguous(combined):
+    sheet = openpyxl.load_workbook(io.BytesIO(combined[0]))[OTHERS]
+    sequence = []
+    for row in range(2, sheet.max_row + 1):
+        if not sheet.cell(row, 3).value:
+            break
+        sequence.append(str(sheet.cell(row, 1).value or "").strip())
+    runs = [v for index, v in enumerate(sequence) if index == 0 or sequence[index - 1] != v]
+    assert len(runs) == len(set(runs)), runs
 
 
 def test_combined_summary_mentions_both_sheets(combined):
     text = combined[1].text()
-    assert "一线人员" in text or "直接插入" in text
-    assert "副主任表直接插入" in text
-    assert "副主任表直接删除" in text
+    assert "直接插入 279 人（红字）" in text
+    assert "直接删除 41 人" in text
+    assert "副主任表直接插入 15 人（红字）" in text
+    assert "副主任表直接删除 11 人" in text
     assert "移到「副主任&工艺组长及其他」15 人" in text

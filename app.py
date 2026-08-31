@@ -12,7 +12,12 @@ import os
 import pandas as pd
 import streamlit as st
 
-from tj4tools.bonus_export import build_combined_workbook, build_workbook, split_by_action
+from tj4tools.bonus_export import (
+    build_combined_workbook,
+    build_workbook,
+    merge_others_inserts,
+    split_by_action,
+)
 from tj4tools.db import Workspace
 from tj4tools.ingest import ingest_files
 from tj4tools.normalize import date_from_filename, fmt_date, months_before
@@ -1332,7 +1337,9 @@ def render_combined_feature(payload, result, roster, bonus, frontline_analysis, 
         "一次生成一份核算表，同时改「一线人员」和「副主任&工艺组长及其他」。"
         "默认把两侧**还没点取消**的人都按「应用」处理（直接删行 / 插入，新增红字，实习生黄底）；"
         "已经在 ①② 里点过「取消」的人仍然排除。"
-        "同一个人既要从一线移出、又是副主任表待新增时，副主任表只插一行。"
+        "同一个人既要从一线移出、又是副主任表待新增时，副主任表只插一行"
+        "（一线侧仍是「移到副主任表」时，即使②点了不新增，这个人还是会写进旧表，职务沿用清单写法）。"
+        "未指定车间的人请回 ①② 的「车间映射」里指定，否则生成时会被跳过。"
     )
     if bonus.others_layout is None:
         st.error("核算文件里找不到「副主任&工艺组长及其他」子表，无法一键生成两表。")
@@ -1378,7 +1385,9 @@ def render_combined_feature(payload, result, roster, bonus, frontline_analysis, 
         supervisor_review, supervisor_analysis, approved_only=approved_only
     )
     move_keys = {item.key for item in fl_moves}
-    unique_sup_adds = [item for item in sup_adds if item.key not in move_keys]
+    unique_sup_adds = [
+        item for item in merge_others_inserts(fl_moves, sup_adds) if item.key not in move_keys
+    ]
 
     left, right = st.columns(2)
     with left:
