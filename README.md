@@ -210,7 +210,7 @@ tj4tools/
   bonus_export.py           功能一的导出编排 + 通用的"插进某张子表"
   supervisor.py             功能二的取人口径与对账
   supervisor_export.py      功能二的导出编排
-tests/                      156 项测试，全部基于仓库里的真实文件
+tests/                      158 项测试，全部基于仓库里的真实文件
 .cursor/skills/             5 个配套 skill
 ```
 

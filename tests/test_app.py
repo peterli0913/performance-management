@@ -147,6 +147,32 @@ def test_pending_delete_action_override_reaches_the_export(app):
     assert values["移动到副主任表格"] == "15"
 
 
+def test_action_edit_updates_the_metrics_in_the_same_run():
+    """指标渲染在表格上方，改完动作必须立刻重跑一次，否则数字要等下次交互才变。"""
+    instance = AppTest.from_file(APP, default_timeout=250).run()
+    key = "main_pending_editor_待定需填入人员（核算有·清单无）_0"
+    keys = [name for name in instance.session_state.filtered_state if "pending_editor" in name]
+    assert keys == [key], keys
+    instance.session_state[key] = {
+        "edited_rows": {0: {"动作": "保留在一线人员"}},
+        "added_rows": [],
+        "deleted_rows": [],
+    }
+    instance.run()
+    assert not instance.exception, [e.value for e in instance.exception]
+    values = {metric.label: metric.value for metric in instance.metric}
+    assert values["保留在一线人员"] == "2"
+    assert values["移动到副主任表格"] == "14"
+    assert len(instance.session_state["action_override"]) == 1
+
+
+def test_checkbox_edit_updates_the_metrics_in_the_same_run():
+    instance = AppTest.from_file(APP, default_timeout=250).run()
+    _tick(instance, "main_editor_新入职员工_0", [0, 1, 2])
+    metrics = [m for m in instance.metric if m.label == "已应用"]
+    assert metrics[0].value == "3"
+
+
 def test_choice_labels_spell_out_the_action(app):
     """按钮/勾选框不能只写"应用/取消"，要写清楚是新增还是删除。"""
     labels = [button.label for button in app.button]

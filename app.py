@@ -476,10 +476,15 @@ def render_pending_delete(review: Review, category, items) -> None:
         },
         disabled=[column for column in order if column != "动作"],
     )
+    changed = False
     for item, before, after in zip(items, frame["动作"], edited["动作"]):
         if after != before:
             review.action_override[item.label] = after
+            changed = True
     st.caption("这一类不用勾「应用/取消」——动作列选什么就执行什么，两个导出都会照此处理。")
+    if changed:
+        # 指标渲染在表格上方，不重跑一次的话要等下次交互才更新
+        st.rerun()
 
     moves = [item for item, action in zip(items, decided) if action == ACTION_TO_OTHERS]
     unmapped = [item for item in moves if not item.target_workshop]
@@ -604,21 +609,28 @@ def render_table(review: Review, category, items, mapping, options, editable) ->
         column_config=config,
         disabled=disabled,
     )
+    changed = False
     for index, item in enumerate(items):
+        before = decisions.get(item.label)
         if bool(edited["应用"].iloc[index]):
             decisions[item.label] = APPLY
         elif bool(edited["取消"].iloc[index]):
             decisions[item.label] = CANCEL
         else:
             decisions.pop(item.label, None)
+        changed = changed or decisions.get(item.label) != before
         if editable:
             now = edited["车间"].iloc[index]
             if now != frame["车间"].iloc[index]:
                 overrides[item.label] = to_workshop(now)
+                changed = True
     st.caption(
         f"「{apply_label}」= 纳入「已应用版」导出；「{cancel_label}」= 从两个导出里都剔除；"
         f"两个都不勾 = 待定，只出现在「对照标记版」里。两个都勾时按「{apply_label}」处理。"
     )
+    if changed:
+        # 上方的统计指标要立刻跟着变，否则得等下一次交互才刷新
+        st.rerun()
 
 
 def render_rows(review: Review, category, items, mapping, editable) -> None:
