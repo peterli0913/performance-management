@@ -51,7 +51,7 @@ def test_interns_are_included_and_counted(app):
 
 def test_unmapped_groups_are_summarised_not_dumped(app):
     warnings = [block.value for block in app.warning]
-    assert any("23 名待新增人员" in text for text in warnings)
+    assert any("74 名待新增人员" in text for text in warnings)
     # 长长的分组清单要收进折叠区，而不是塞在警告文字里
     assert all(len(text) < 120 for text in warnings), warnings
 
@@ -88,8 +88,8 @@ def test_generate_marked_workbook_end_to_end(app):
     assert "按清单更新 1 人" in success
     assert "移到「副主任&工艺组长及其他」15 人" in success
     assert "实习生" in success
-    # 23 名分组无法自动对应车间的人员应被跳过而不是硬塞进去
-    assert "跳过 23 人" in success
+    # 带括号的分组不再自动落车间，加上原本对不上的，一并跳过
+    assert "跳过 74 人" in success
 
 
 def test_window_date_change_reruns_and_shifts_the_split(app):
@@ -287,7 +287,7 @@ def test_supervisor_unmapped_warning_is_live(supervisor_app):
     warnings = [block.value for block in supervisor_app.warning]
     live = [text for text in warnings if "没有对应车间" in text]
     assert len(live) == 1, warnings
-    assert "还有 14 名待新增人员" in live[0]
+    assert "还有 24 名待新增人员" in live[0]
 
 
 def test_supervisor_generates_and_offers_download(supervisor_app):
@@ -341,7 +341,8 @@ def test_table_checkboxes_survive_reruns_and_reach_the_export():
     next(b for b in instance.button if b.label == "生成已应用版").click().run()
     assert not instance.exception, [e.value for e in instance.exception]
     messages = [block.value for block in instance.success]
-    assert any("直接插入 3 人" in text for text in messages), messages
+    # 前几行里可能有带括号、尚未手选车间的人，导出时会被跳过
+    assert any("直接插入 2 人" in text for text in messages), messages
 
 
 def test_unticked_rows_stay_undecided():
@@ -352,7 +353,7 @@ def test_unticked_rows_stay_undecided():
     assert instance.session_state["decisions"] == {}
     next(b for b in instance.button if b.label == "生成对照标记版").click().run()
     messages = [block.value for block in instance.success]
-    assert any("新增 279 人" in text for text in messages), messages
+    assert any("新增 228 人" in text for text in messages), messages
 
 
 def test_cancel_column_removes_person_from_both_exports():
@@ -361,7 +362,7 @@ def test_cancel_column_removes_person_from_both_exports():
     assert list(instance.session_state["decisions"].values()) == ["取消"] * 2
     next(b for b in instance.button if b.label == "生成对照标记版").click().run()
     messages = [block.value for block in instance.success]
-    assert any("新增 277 人" in text for text in messages), messages
+    assert any("新增 227 人" in text for text in messages), messages
 
 
 def test_combined_feature_is_on_the_radio():
@@ -374,7 +375,7 @@ def test_combined_feature_is_on_the_radio():
     labels = [button.label for button in instance.button]
     assert "生成全部已应用版" in labels
     markdown = " ".join(block.value for block in instance.markdown)
-    assert "将新增 **279** 人" in markdown
+    assert "将新增 **228** 人" in markdown
     assert "移到副主任表 **15** 人" in markdown
     captions = " ".join(block.value for block in instance.caption)
     assert "另有 15 人从一线移入" in captions
@@ -400,10 +401,10 @@ def test_combined_generate_offers_one_download():
     next(b for b in instance.button if b.label == "生成全部已应用版").click().run()
     assert not instance.exception, [e.value for e in instance.exception]
     success = " ".join(block.value for block in instance.success)
-    assert "直接插入 279 人" in success
+    assert "直接插入 228 人" in success
     assert "直接删除 41 人" in success
     assert "移到「副主任&工艺组长及其他」15 人" in success
-    assert "副主任表直接插入 15 人" in success
+    assert "副主任表直接插入 5 人" in success
     assert "副主任表直接删除 11 人" in success
     labels = [d.label for d in instance.get("download_button")]
     assert any("两表已应用版" in label for label in labels)
@@ -413,12 +414,12 @@ def test_preview_counts_match_generated_counts():
     """预览"将新增 N 人"必须等于生成结果里的 N，未指定车间的人不能算进预览。"""
     instance = AppTest.from_file(APP, default_timeout=200).run()
     markdown = " ".join(block.value for block in instance.markdown)
-    assert "将新增 **279** 人" in markdown, markdown[-500:]
+    assert "将新增 **228** 人" in markdown, markdown[-500:]
     captions = " ".join(block.value for block in instance.caption)
-    assert "另有 23 人未指定车间" in captions
+    assert "另有 74 人未指定车间" in captions
     next(b for b in instance.button if b.label == "生成对照标记版").click().run()
-    assert any("新增 279 人" in block.value for block in instance.success)
+    assert any("新增 228 人" in block.value for block in instance.success)
 
     _tick(instance, "main_editor_新入职员工_0", [0], column="取消")
     markdown = " ".join(block.value for block in instance.markdown)
-    assert "将新增 **278** 人" in markdown
+    assert "将新增 **227** 人" in markdown

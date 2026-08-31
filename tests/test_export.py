@@ -610,9 +610,9 @@ def test_apply_mode_keeps_formulas_consistent(bonus_bytes, bonus, result):
 
 
 def test_new_workshop_block_is_created(bonus_bytes, bonus, result):
-    items = [i for i in result.items if i.action == "add"][:3]
-    for item in items:
-        item.workshop = "13号楼"
+    from dataclasses import replace
+
+    items = [replace(i, workshop="13号楼") for i in result.items if i.action == "add"][:3]
     data, summary = build_workbook(bonus_bytes, bonus, items, [], mode="mark")
     assert summary.new_blocks == ["13号楼"]
     assert any("新建分组块" in w for w in summary.warnings)

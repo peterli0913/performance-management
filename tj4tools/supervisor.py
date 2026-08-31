@@ -148,7 +148,10 @@ def reconcile_supervisors(
         person = target[key]
         is_new, reasons, flags = new_hire_evidence(person, roster, new_hire_since, anchor)
         duty = duty_map.get(person.title, person.title)
-        workshop = workshop_map.get(person.group, "")
+        workshop_guess = workshop_map.get(person.group)
+        workshop = workshop_guess.workshop if workshop_guess is not None else ""
+        if workshop_guess is not None and workshop_guess.needs_manual:
+            flags.append("目前分组带括号，车间需人工确认")
         if not workshop:
             flags.append(f"分组「{person.group}」在本表里没有对应车间，需要手工指定")
         reasons.append(f"归入依据：{groups[key]}")

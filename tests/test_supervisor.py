@@ -34,7 +34,9 @@ FRONTLINE = "一线人员"
 def placeable(roster_with_interns, bonus):
     """功能一能放进一线车间的人——严格口径要把他们排除掉。"""
     analysis = reconcile(roster_with_interns, bonus)
-    return {item.key for item in analysis.items if item.action == "add" and item.workshop}
+    from tj4tools.roster import placeable_keys
+
+    return placeable_keys(analysis)
 
 
 @pytest.fixture(scope="module")
@@ -138,10 +140,11 @@ def test_removes_explain_why_they_are_out_of_scope(strict):
 def test_unmapped_groups_are_reported(strict):
     """只给出数据，提示语交给界面按"当前生效的映射"实时算，避免人工指定完文案还挂着。"""
     assert strict.unmapped_groups
-    assert sum(count for _, count in strict.unmapped_groups) == 14
+    assert sum(count for _, count in strict.unmapped_groups) == 24
     assert not any("没有对应车间" in note for note in strict.notes)
     unmapped = [i for i in strict.items if i.action == "add" and not i.workshop]
-    assert len(unmapped) == 14
+    assert len(unmapped) == 24
+    assert any(i.group.startswith("生产技术转移组") for i in unmapped)
     assert all(any("没有对应车间" in flag for flag in i.flags) for i in unmapped)
 
 
@@ -174,7 +177,15 @@ def test_intern_classification_carries_over(roster_with_interns, bonus, placeabl
 
 @pytest.fixture(scope="module")
 def generated(bonus_bytes, bonus, strict):
-    items = [i for i in strict.items if i.action != "add" or i.workshop]
+    from dataclasses import replace
+
+    items = []
+    for item in strict.items:
+        if item.action == "add" and not item.workshop:
+            if item.group != "生产技术转移组(多肽)":
+                continue
+            item = replace(item, workshop=item.group, target_workshop=item.group)
+        items.append(item)
     adds, removes = split_by_action(items)
     mark, mark_summary = build_supervisor_workbook(bonus_bytes, bonus, adds, removes, mode="mark")
     applied, applied_summary = build_supervisor_workbook(
@@ -227,7 +238,13 @@ def test_workshop_text_is_written_verbatim(bonus_bytes, bonus, roster_with_inter
     strict = reconcile_supervisors(
         roster_with_interns, bonus, scope=SCOPE_STRICT, placeable_keys=placeable
     )
-    adds = [i for i in strict.items if i.action == "add" and i.workshop == "生产技术转移组(多肽)"]
+    from dataclasses import replace
+
+    adds = [
+        replace(i, workshop=i.group, target_workshop=i.group)
+        for i in strict.items
+        if i.action == "add" and i.group == "生产技术转移组(多肽)"
+    ]
     assert adds, "样本里应当有要加进这个车间的人"
     data, _ = build_supervisor_workbook(bonus_bytes, bonus, adds, [], mode="apply")
     sheet = openpyxl.load_workbook(io.BytesIO(data))[SHEET]

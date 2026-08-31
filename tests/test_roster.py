@@ -240,17 +240,53 @@ def test_workshop_mapping_prefers_empirical_evidence(roster, bonus):
     assert mapping["12号楼CNC区域"].workshop == "12号楼"
     assert mapping["验证组"].workshop == "计算机化设备保障&验证组"
     assert mapping["外围/罐区组"].workshop == "外围/罐区/泵房"
-    assert mapping["清洗组(4号楼)"].workshop == "清洗组"
+    assert mapping["清洗组(4号楼)"].workshop == ""
+    assert mapping["清洗组(4号楼)"].needs_manual
+    assert mapping["清洗组(4号楼)"].suggested == "清洗组"
     for group in ("4号楼1&2车间", "11号楼CNC区域", "12号楼CNC区域", "5号楼"):
         assert mapping[group].confidence == "高"
         assert mapping[group].source == "经验"
 
 
+def test_parenthetical_groups_are_held_for_manual_review(roster, bonus):
+    """目前分组带括号（委培、清洗组分区等）不自动落车间，只把推断留作建议。"""
+    from tj4tools.roster import group_needs_manual, placeable_keys
+
+    mapping = build_workshop_mapping(roster, bonus)
+    assert group_needs_manual("13号楼(12号楼委培)")
+    assert group_needs_manual("生产技术转移组（多肽）")
+    assert not group_needs_manual("4号楼1&2车间")
+
+    weipei = mapping["13号楼(12号楼委培)"]
+    assert weipei.workshop == ""
+    assert weipei.needs_manual
+    assert weipei.suggested == "12号楼"
+
+    result = reconcile(roster, bonus)
+    held = [i for i in result.items if i.action == "add" and group_needs_manual(i.group)]
+    assert held
+    assert all(not i.workshop for i in held)
+    assert any("带括号" in " ".join(i.flags) for i in held)
+
+    # 委培人功能一仍打算放进一线，不能因为还没手选就漏到副主任表
+    keys = placeable_keys(result)
+    assert any(i.group == "13号楼(12号楼委培)" and i.key in keys for i in held)
+    assert any(i.group.startswith("生产技术转移组") and i.key not in keys for i in held)
+
+
 def test_unmappable_groups_are_reported(result):
     unmapped = [item for item in result.items if item.action == "add" and not item.workshop]
     assert unmapped, "应当存在需要人工指定车间的人员"
-    assert all("生产技术转移组" in i.group or "在其他厂区" in i.group or "安全组" in i.group
-               or "计算机化设备保障组" == i.group for i in unmapped)
+    from tj4tools.roster import group_needs_manual
+
+    assert all(
+        group_needs_manual(i.group)
+        or "生产技术转移组" in i.group
+        or "在其他厂区" in i.group
+        or "安全组" in i.group
+        or "计算机化设备保障组" == i.group
+        for i in unmapped
+    )
     # 待指定分组要按人数汇总报出来，供界面渲染成清单
     assert result.unmapped_groups
     assert sum(count for _, count in result.unmapped_groups) == len(unmapped)

@@ -22,7 +22,6 @@ from tj4tools.db import Workspace
 from tj4tools.ingest import ingest_files
 from tj4tools.normalize import date_from_filename, fmt_date, months_before
 from tj4tools.roster import (
-    ACTION_ADD,
     ADD_CATEGORIES,
     CATEGORIES,
     INTERN_MONTHS,
@@ -30,9 +29,11 @@ from tj4tools.roster import (
     CATEGORY_NEW,
     CATEGORY_PENDING_ADD,
     CATEGORY_PENDING_DEL,
+    build_others_workshop_map,
     build_workshop_mapping,
     parse_bonus,
     parse_roster,
+    placeable_keys,
     reconcile,
 )
 from tj4tools.supervisor import (
@@ -106,6 +107,27 @@ def _parsed_pair(roster_name, roster_bytes, bonus_name, bonus_bytes, duty_field,
         roster_bytes, roster_name, duty_field=duty_field, include_interns=include_interns
     )
     return roster, parse_bonus(bonus_bytes, bonus_name)
+
+
+@st.cache_data(show_spinner=False)
+def cached_others_workshop_map(
+    roster_name, roster_bytes, bonus_name, bonus_bytes, duty_field, include_interns
+):
+    roster, bonus = _parsed_pair(
+        roster_name, roster_bytes, bonus_name, bonus_bytes, duty_field, include_interns
+    )
+    return build_others_workshop_map(roster, bonus)
+
+
+def resolved_placeable(review: "Review", analysis) -> frozenset:
+    """功能一能放进一线的人：已指定车间，或带括号只是等确认、但已有建议。"""
+    keys = set(placeable_keys(analysis))
+    for item in analysis.items:
+        if item.action != "add":
+            continue
+        if to_workshop(effective_workshop(review, item, analysis.mapping)):
+            keys.add(item.key)
+    return frozenset(keys)
 
 
 @st.cache_data(show_spinner=False)
@@ -313,6 +335,16 @@ def describe_guess(guess) -> str:
         return "需人工指定"
     if isinstance(guess, str):
         return guess or "需人工指定"
+    hint = guess.suggested or guess.workshop
+    if guess.needs_manual:
+        if not hint:
+            return "需人工指定（分组名带括号）"
+        extra = ""
+        if guess.source == "经验" and guess.support:
+            extra = f"；两表已匹配 {guess.support} 人 · 置信度{guess.confidence}"
+        elif guess.source == "规则":
+            extra = "；按命名规则推断"
+        return f"{hint}（分组名带括号，请人工确认{extra}）"
     if not guess.workshop:
         return "需人工指定"
     if guess.source == "经验":
@@ -1094,7 +1126,8 @@ def render_frontline_feature(payload, result, bonus, analysis, options_) -> None
         analysis.mapping,
         adds,
         options,
-        "「自动建议」由两表已匹配人员反推得出。置信度低或显示「需人工指定」的行请在右侧下拉里选择；"
+        "「自动建议」由两表已匹配人员反推得出。置信度低、带括号或显示「需人工指定」的行请在右侧下拉里选择；"
+        "目前分组带括号的（委培、分区等）一律不自动落车间，必须手选。"
         "选「＋新建车间块」会在一线人员子表最下方新建该分组。",
     )
 
@@ -1147,13 +1180,9 @@ def render_supervisor_feature(payload, result, roster, bonus, frontline_analysis
         st.error("核算文件里找不到「副主任&工艺组长及其他」子表。")
         return
 
-    # 功能一能放进一线车间的人不该再进这张表，否则同一个人会出现在两张子表里
-    placeable = frozenset(
-        item.key
-        for item in frontline_analysis.items
-        if item.action == "add"
-        and to_workshop(effective_workshop(Review(""), item, frontline_analysis.mapping))
-    )
+    # 功能一能放进一线车间的人不该再进这张表，否则同一个人会出现在两张子表里。
+    # 带括号的分组还没手选车间，但只要有建议就不算"放不进一线"。
+    placeable = resolved_placeable(Review(""), frontline_analysis)
 
     try:
         analysis = cached_supervisor_analyze(
@@ -1207,7 +1236,14 @@ def render_supervisor_feature(payload, result, roster, bonus, frontline_analysis
         )
 
     adds = [item for item in analysis.items if item.action == "add"]
-    workshop_mapping = {item.group: item.target_workshop for item in adds}
+    workshop_mapping = cached_others_workshop_map(
+        options_["roster_name"],
+        result.raw_files[options_["roster_name"]],
+        bonus_name,
+        result.raw_files[bonus_name],
+        options_["duty_field"],
+        options_["include_interns"],
+    )
     options = build_options(layout.workshops, {item.group for item in adds})
     render_unmapped_warning(review, adds, workshop_mapping)
     render_mapping_editor(
@@ -1216,7 +1252,8 @@ def render_supervisor_feature(payload, result, roster, bonus, frontline_analysis
         adds,
         options,
         "把清单的「目前分组」对应到本表的车间。本表的车间叫法和一线人员不同"
-        "（如「11号楼车间D级区域」）；选「＋新建车间块」会在本表人员区最下方新建。",
+        "（如「11号楼车间D级区域」）。目前分组带括号的一律不自动落车间，必须手选；"
+        "选「＋新建车间块」会在本表人员区最下方新建。",
     )
 
     tabs = st.tabs(
@@ -1345,12 +1382,7 @@ def render_combined_feature(payload, result, roster, bonus, frontline_analysis, 
         st.error("核算文件里找不到「副主任&工艺组长及其他」子表，无法一键生成两表。")
         return
 
-    placeable = frozenset(
-        item.key
-        for item in frontline_analysis.items
-        if item.action == "add"
-        and to_workshop(effective_workshop(frontline_review, item, frontline_analysis.mapping))
-    )
+    placeable = resolved_placeable(frontline_review, frontline_analysis)
     try:
         supervisor_analysis = cached_supervisor_analyze(
             options_["roster_name"],

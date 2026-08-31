@@ -707,6 +707,8 @@ class WorkshopGuess:
     support: int = 0
     share: float = 0.0
     headcount: int = 0
+    suggested: str = ""
+    needs_manual: bool = False
 
     @property
     def confidence(self) -> str:
@@ -723,6 +725,39 @@ class WorkshopGuess:
 
 _PAREN = re.compile(r"[（(]([^（()）]*)[)）]")
 _TRAINEE = re.compile(r"[（(]([^（()）]*?)委培[)）]")
+_HAS_PAREN = re.compile(r"[（()）]")
+
+
+def group_needs_manual(group: str) -> bool:
+    """「目前分组」带括号（委培、分区清洗组等）一律留给人工判断落哪个车间。"""
+    return bool(_HAS_PAREN.search(group or ""))
+
+
+def withhold_parenthetical(mapping: dict[str, WorkshopGuess]) -> dict[str, WorkshopGuess]:
+    """把带括号分组的自动车间收成建议，避免委培/分区被静默写进核算表。"""
+    for guess in mapping.values():
+        if not group_needs_manual(guess.group) or not guess.workshop:
+            continue
+        guess.needs_manual = True
+        guess.suggested = guess.workshop
+        guess.workshop = ""
+    return mapping
+
+
+def placeable_keys(analysis) -> set[tuple[str, str]]:
+    """功能一打算放进一线的人（含带括号、还等手选车间的委培），功能二要排除他们。"""
+    mapping = getattr(analysis, "mapping", None) or {}
+    keys: set[tuple[str, str]] = set()
+    for item in analysis.items:
+        if item.action != "add":
+            continue
+        if item.workshop:
+            keys.add(item.key)
+            continue
+        guess = mapping.get(item.group)
+        if guess is not None and guess.needs_manual and guess.suggested:
+            keys.add(item.key)
+    return keys
 
 
 def build_workshop_mapping(roster: RosterFile, bonus: BonusFile) -> dict[str, WorkshopGuess]:
@@ -759,6 +794,10 @@ def build_workshop_mapping(roster: RosterFile, bonus: BonusFile) -> dict[str, Wo
             source="规则" if guessed else "未知",
             headcount=headcount.get(group, 0),
         )
+    withhold_parenthetical(mapping)
+    for guess in mapping.values():
+        if group_needs_manual(guess.group) and not guess.workshop:
+            guess.needs_manual = True
     return dict(sorted(mapping.items(), key=lambda item: -item[1].headcount))
 
 
@@ -980,7 +1019,8 @@ def _attach_update(
         return
     item.action = ACTION_MOVE
     item.target_sheet = SHEET_OTHERS
-    mapped = others_workshops.get(source.group)
+    guess = others_workshops.get(source.group)
+    mapped = guess.workshop if guess is not None else ""
     item.target_workshop = mapped or current.workshop
     item.target_workshop_source = "经验映射" if mapped else "沿用一线车间"
     item.reason += f"，职务「{source.duty}」不属一线四种职务，移到「{SHEET_OTHERS}」"
@@ -1099,7 +1139,21 @@ def build_others_workshop_map(roster: RosterFile, bonus: BonusFile) -> dict[str,
         source = roster.production_all.get(key)
         if source is not None and source.group and person.workshop:
             votes[source.group][person.workshop] += 1
-    return {group: counter.most_common(1)[0][0] for group, counter in votes.items()}
+    mapping = {
+        group: WorkshopGuess(
+            group=group,
+            workshop=counter.most_common(1)[0][0],
+            source="经验",
+            support=counter.most_common(1)[0][1],
+            share=counter.most_common(1)[0][1] / sum(counter.values()),
+        )
+        for group, counter in votes.items()
+    }
+    withhold_parenthetical(mapping)
+    for guess in mapping.values():
+        if group_needs_manual(guess.group) and not guess.workshop:
+            guess.needs_manual = True
+    return mapping
 
 
 def reconcile(
@@ -1177,6 +1231,8 @@ def reconcile(
         is_new, reasons, extra_flags = new_hire_evidence(person, roster, new_hire_since, anchor)
         flags.extend(extra_flags)
         guess = mapping.get(person.group)
+        if guess is not None and guess.needs_manual:
+            flags.append("目前分组带括号，车间需人工确认")
         item = DiffItem(
             key=key,
             name=person.name,
@@ -1272,11 +1328,7 @@ def reconcile(
         notes.append(
             f"有 {late_interns} 名实习生在判断日期 {intern_asof} 之后入职，按规则不加入表格"
         )
-    pending = Counter(
-        item.group
-        for item in items
-        if item.action == "add" and not (mapping.get(item.group) and mapping[item.group].workshop)
-    )
+    pending = Counter(item.group for item in items if item.action == "add" and not item.workshop)
     unmapped = sorted(pending.items(), key=lambda kv: (-kv[1], kv[0]))
 
     return Reconciliation(
