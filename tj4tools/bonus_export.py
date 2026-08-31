@@ -206,10 +206,12 @@ def build_workbook(
         anchor, exact = bonus.anchor_for(workshop, duty)
         if not exact:
             summary.fallback_duties.append(f"{workshop}·{duty}")
+        _, block_start, block_end = known[workshop]
+        anchor = _live_anchor(anchor, delete_rows, block_start, block_end)
         groups.append(
             InsertGroup(
                 anchor_row=anchor,
-                template_row=_pick_template(known[workshop][1], anchor, delete_rows),
+                template_row=_pick_template(block_start, anchor, delete_rows),
                 rows=[_new_row(item, columns, mode) for item in items],
                 new_block=False,
             )
@@ -355,10 +357,13 @@ def insert_into_layout(
             summary.new_other_workshops.append(workshop)
         # 写回用单元格里的原始文本，避免全角/半角括号差异把车间块拆成两段
         label = layout.raw_workshop(workshop)
+        block = layout.block_of(workshop)
+        start, end = (block[1], block[2]) if block else (layout.first_data_row, layout.last_data_row)
+        live = _live_anchor(anchor, deletes or set(), start, end)
         groups.append(
             InsertGroup(
-                anchor_row=anchor,
-                template_row=_pick_template(layout.first_data_row, anchor, deletes or set()),
+                anchor_row=live,
+                template_row=_pick_template(layout.first_data_row, live, deletes or set()),
                 rows=[
                     _new_row(item, columns, mode, workshop=label, duty=duty) for item in bucket
                 ],
@@ -468,6 +473,25 @@ def _new_row(
     else:
         fonts = {column: FONT_RED for column in values}
     return NewRow(values=values, fills=fills, font_colors=fonts)
+
+
+def _live_anchor(anchor: int | None, deletes: set[int], block_start: int, block_end: int) -> int:
+    """插入必须跟在还活着的行后面。
+
+    职务段最后一行被删时如果仍用它当锚点，新行号会和下一位未删人员撞车，
+    把人盖掉（黄金样本里 12 号楼班长黄宣童就是这样没的）。
+    """
+    if not anchor:
+        return block_end
+    if anchor not in deletes:
+        return anchor
+    for row in range(min(anchor, block_end) - 1, block_start - 1, -1):
+        if row not in deletes:
+            return row
+    for row in range(block_start, block_end + 1):
+        if row not in deletes:
+            return row
+    return block_end
 
 
 def _pick_template(start: int, end: int, deletes: set[int]) -> int:

@@ -602,6 +602,7 @@ class XlsxEditor:
         for item in highlights:
             highlight_map.setdefault(item.row, []).append(item)
 
+        self._carry_merge_values(root, rows, delete_set)
         for old_row, element in rows.items():
             if old_row in delete_set:
                 sheet_data.remove(element)
@@ -882,6 +883,54 @@ class XlsxEditor:
         row.append(cell)
 
     # -- 工作表其余元素 ---------------------------------------------------- #
+
+    def _carry_merge_values(
+        self, root: ET.Element, rows: dict[int, ET.Element], delete_set: set[int]
+    ) -> None:
+        """合并区第一行被删时，把车间名等值抄到区内第一个还活着的行。"""
+        merge = root.find(_q("mergeCells"))
+        if merge is None or not delete_set:
+            return
+        for cell in merge.findall(_q("mergeCell")):
+            ref = cell.get("ref") or ""
+            if ":" not in ref:
+                continue
+            left, right = ref.split(":", 1)
+            try:
+                col1, start = split_coord(left)
+                col2, end = split_coord(right)
+            except ValueError:
+                continue
+            if col1 != col2 or start not in delete_set:
+                continue
+            survivor = next(
+                (row for row in range(start + 1, end + 1) if row not in delete_set and row in rows),
+                None,
+            )
+            if survivor is None or start not in rows:
+                continue
+            self._copy_missing_values(rows[start], rows[survivor], survivor)
+
+    def _copy_missing_values(self, src_row: ET.Element, dst_row: ET.Element, dst_row_index: int) -> None:
+        for src in src_row.findall(_q("c")):
+            if src.find(_q("v")) is None and src.find(_q("is")) is None:
+                continue
+            col, _ = split_coord(src.get("r"))
+            dst = self._find_cell(dst_row, col)
+            if dst is None:
+                dst = ET.Element(_q("c"))
+                dst.set("r", f"{col}{dst_row_index}")
+                if src.get("s"):
+                    dst.set("s", src.get("s"))
+                self._insert_cell_in_order(dst_row, dst, col)
+            elif dst.find(_q("v")) is not None or dst.find(_q("is")) is not None:
+                continue
+            if src.get("t"):
+                dst.set("t", src.get("t"))
+            for tag in ("v", "is"):
+                child = src.find(_q(tag))
+                if child is not None:
+                    dst.append(copy.deepcopy(child))
 
     def _remap_sheet_metadata(
         self, root: ET.Element, rowmap: RowMap, new_merges: list[str], last_row: int

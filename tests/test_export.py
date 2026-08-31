@@ -609,6 +609,50 @@ def test_apply_mode_keeps_formulas_consistent(bonus_bytes, bonus, result):
         assert current.min_row == previous.max_row + 1
 
 
+def test_apply_keeps_people_not_removed_or_moved(bonus_bytes, bonus, result):
+    """职务段最后一行被删时，不能把下一段还留着的人盖掉。
+
+    黄金样本：12号楼工程师郭权龙要删，同时又往该段插新工程师，
+    下一行班长黄宣童必须还在「12号楼」块里。
+    """
+    adds = _mapped(result)
+    removes = [item for item in result.items if item.action == "remove"]
+    updates = [item for item in result.items if item.action == "update"]
+    moves = [item for item in result.items if item.action == "move"]
+    data, _ = build_workbook(bonus_bytes, bonus, adds, removes, updates, moves, mode="apply")
+    workbook = openpyxl.load_workbook(io.BytesIO(data))
+    sheet = workbook[SHEET]
+    from tj4tools.normalize import norm_eid, norm_name
+
+    present = {
+        (norm_name(sheet.cell(row, 3).value), norm_eid(sheet.cell(row, 4).value))
+        for row in range(3, sheet.max_row + 1)
+    }
+    gone = {item.key for item in removes + moves}
+    renamed = {
+        item.key: (
+            norm_name(item.new_values.get("姓名") or item.name),
+            norm_eid(item.new_values.get("员工编号") or item.eid),
+        )
+        for item in updates
+    }
+    missing = []
+    for key, person in bonus.frontline.items():
+        if key in gone:
+            continue
+        expect = renamed.get(key, (person.name, person.eid))
+        if expect not in present:
+            missing.append((person.name, person.eid, person.row, person.workshop))
+    assert missing == [], missing[:8]
+    assert (norm_name("黄宣童"), norm_eid("ALS14566")) in present
+    workshops = {
+        str(sheet.cell(merge.min_row, 1).value or "")
+        for merge in sheet.merged_cells.ranges
+        if merge.min_col == 1 == merge.max_col and merge.min_row >= 3
+    }
+    assert "12号楼" in workshops
+
+
 def test_new_workshop_block_is_created(bonus_bytes, bonus, result):
     from dataclasses import replace
 
