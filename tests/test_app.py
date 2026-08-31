@@ -203,6 +203,7 @@ def test_duty_field_switch_reruns_without_error(app):
 
 FEATURE_SUPERVISOR = "② 副主任&工艺组长及其他"
 FEATURE_COMBINED = "③ 一键生成全部"
+FEATURE_SEARCH = "④ 检索与投放"
 
 
 def _walk(node, out=None):
@@ -423,3 +424,32 @@ def test_preview_counts_match_generated_counts():
     _tick(instance, "main_editor_新入职员工_0", [0], column="取消")
     markdown = " ".join(block.value for block in instance.markdown)
     assert "将新增 **227** 人" in markdown
+
+
+def test_search_feature_is_on_the_radio():
+    instance = AppTest.from_file(APP, default_timeout=200).run()
+    feature = instance.radio(key="feature")
+    assert FEATURE_SEARCH in feature.options
+    feature.set_value(FEATURE_SEARCH).run()
+    assert not instance.exception, [e.value for e in instance.exception]
+    assert _stray_elements(instance) == []
+    assert any(button.label == "搜索" for button in instance.button)
+    assert any("按投放清单生成已应用版" in button.label for button in instance.button)
+
+
+def test_search_by_name_shows_file_and_full_row():
+    instance = AppTest.from_file(APP, default_timeout=200).run()
+    instance.radio(key="feature").set_value(FEATURE_SEARCH).run()
+    box = next(widget for widget in instance.text_input if "关键字" in widget.label)
+    box.set_value("张文艺")
+    next(button for button in instance.button if button.label == "搜索").click().run()
+    assert not instance.exception, [e.value for e in instance.exception]
+    assert _stray_elements(instance) == []
+    markdown = " ".join(str(block.value) for block in instance.markdown)
+    frames = " ".join(frame.value.to_string() for frame in instance.dataframe if hasattr(frame.value, "to_string"))
+    blob = markdown + " " + frames
+    assert "张文艺" in blob
+    assert "人员清单" in blob or "生产部" in blob
+    next(button for button in instance.button if button.label == "加入投放清单").click().run()
+    assert not instance.exception, [e.value for e in instance.exception]
+    assert any("投放清单（1）" in block.value for block in instance.subheader)

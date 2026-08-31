@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import uuid
+from dataclasses import asdict
 
 import pandas as pd
 import streamlit as st
@@ -29,6 +31,8 @@ from tj4tools.roster import (
     CATEGORY_NEW,
     CATEGORY_PENDING_ADD,
     CATEGORY_PENDING_DEL,
+    SHEET_FRONTLINE,
+    SHEET_OTHERS,
     build_others_workshop_map,
     build_workshop_mapping,
     parse_bonus,
@@ -36,7 +40,14 @@ from tj4tools.roster import (
     placeable_keys,
     reconcile,
 )
+from tj4tools.search import (
+    infer_fields,
+    placements_from_dicts,
+    search_tables,
+    split_placements,
+)
 from tj4tools.supervisor import (
+    MANAGEMENT_TITLES,
     SCOPE_STRICT,
     build_duty_map,
     describe_duty_map,
@@ -119,6 +130,17 @@ def cached_others_workshop_map(
     return build_others_workshop_map(roster, bonus)
 
 
+def current_placements():
+    """④ 检索投放清单（session_state 里存 dict，这里还原成 dataclass）。"""
+    return placements_from_dicts(st.session_state.get("manual_placements") or [])
+
+
+def search_bundle(bonus):
+    placements = current_placements()
+    extra_fl, extra_sup = split_placements(placements, bonus)
+    return extra_fl, extra_sup, {item.key for item in placements}
+
+
 def resolved_placeable(review: "Review", analysis) -> frozenset:
     """功能一能放进一线的人：已指定车间，或带括号只是等确认、但已有建议。"""
     keys = set(placeable_keys(analysis))
@@ -127,6 +149,9 @@ def resolved_placeable(review: "Review", analysis) -> frozenset:
             continue
         if to_workshop(effective_workshop(review, item, analysis.mapping)):
             keys.add(item.key)
+    for placement in current_placements():
+        if placement.target_sheet == SHEET_FRONTLINE:
+            keys.add(placement.key)
     return frozenset(keys)
 
 
@@ -725,13 +750,24 @@ def output_name(bonus_name: str, suffix: str) -> str:
     return f"{base}（{suffix}{stamp}）.xlsx"
 
 
-def collect_frontline_items(review: Review, analysis, include_pending, *, approved_only: bool):
+def collect_frontline_items(
+    review: Review,
+    analysis,
+    include_pending,
+    *,
+    approved_only: bool,
+    extra=None,
+    exclude_keys=None,
+):
     """按当前复核结果收集一线人员导出清单。
 
     ``approved_only=True`` 只要勾了「应用」的人（已应用版）；
     ``False`` 则排除勾了「取消」的人（对照标记版 / 一键全部应用）。
     「待定·核算有清单无」始终按动作列执行，不看应用/取消。
+    ``extra`` 是 ④ 检索投放产生的 DiffItem，始终纳入；
+    ``exclude_keys`` 避免和投放清单里同一个人重复处理。
     """
+    skip = exclude_keys or set()
 
     def resolved(item):
         item.workshop = to_workshop(effective_workshop(review, item, analysis.mapping))
@@ -740,8 +776,11 @@ def collect_frontline_items(review: Review, analysis, include_pending, *, approv
     selectable = [
         item
         for item in analysis.items
-        if item.category in (CATEGORY_NEW, CATEGORY_LEFT)
-        or include_pending.get(item.category, True)
+        if item.key not in skip
+        and (
+            item.category in (CATEGORY_NEW, CATEGORY_LEFT)
+            or include_pending.get(item.category, True)
+        )
     ]
     auto = []
     for item in selectable:
@@ -757,12 +796,18 @@ def collect_frontline_items(review: Review, analysis, include_pending, *, approv
         if (review.decisions.get(item.label) == APPLY)
         or (not approved_only and review.decisions.get(item.label) != CANCEL)
     ]
-    return split_by_action(auto + chosen)
+    return split_by_action(auto + chosen + list(extra or []))
 
 
 def render_export(review: Review, bonus_bytes, bonus, analysis, include_pending) -> None:
-    kept = collect_frontline_items(review, analysis, include_pending, approved_only=False)
-    approved = collect_frontline_items(review, analysis, include_pending, approved_only=True)
+    extra_fl, extra_sup, exclude = search_bundle(bonus)
+    kept = collect_frontline_items(
+        review, analysis, include_pending, approved_only=False, extra=extra_fl, exclude_keys=exclude
+    )
+    approved = collect_frontline_items(
+        review, analysis, include_pending, approved_only=True, extra=extra_fl, exclude_keys=exclude
+    )
+    other_adds, other_removes = sup_split_by_action(extra_sup)
 
     left, right = st.columns(2)
     with left:
@@ -773,10 +818,15 @@ def render_export(review: Review, bonus_bytes, bonus, analysis, include_pending)
             "按清单更新的人员就地改值、改动的单元格填**橙色**。被点「取消」的人不纳入。"
         )
         adds, removes, updates, moves = kept
+        if extra_fl or extra_sup:
+            st.caption(f"含检索投放 {len(current_placements())} 人，将随本次导出写入。")
         preview_counts(adds, removes, updates, moves, "标记删除")
         if st.button("生成对照标记版", type="primary", width="stretch",
                      key=review.widget("gen_mark")):
-            generate(review, "mark", bonus_bytes, bonus, adds, removes, updates, moves)
+            generate(
+                review, "mark", bonus_bytes, bonus, adds, removes, updates, moves,
+                other_adds=other_adds, other_removes=other_removes,
+            )
         offer_download(review, "mark", bonus.file_name, "对照标记版")
 
     with right:
@@ -789,7 +839,10 @@ def render_export(review: Review, bonus_bytes, bonus, analysis, include_pending)
         preview_counts(adds, removes, updates, moves, "直接删除")
         if st.button("生成已应用版", type="primary", width="stretch",
                      key=review.widget("gen_apply")):
-            generate(review, "apply", bonus_bytes, bonus, adds, removes, updates, moves)
+            generate(
+                review, "apply", bonus_bytes, bonus, adds, removes, updates, moves,
+                other_adds=other_adds, other_removes=other_removes,
+            )
         offer_download(review, "apply", bonus.file_name, "已应用版")
 
     st.info(
@@ -813,14 +866,33 @@ def preview_counts(adds, removes, updates, moves, remove_label: str) -> None:
         st.caption(f"另有 {pending} 人未指定车间，生成时会被跳过（在上方「车间映射」里指定即可纳入）")
 
 
-def generate(review: Review, mode, bonus_bytes, bonus, adds, removes, updates=(), moves=()) -> None:
-    if not adds and not removes and not updates and not moves:
+def generate(
+    review: Review,
+    mode,
+    bonus_bytes,
+    bonus,
+    adds,
+    removes,
+    updates=(),
+    moves=(),
+    other_adds=(),
+    other_removes=(),
+) -> None:
+    if not adds and not removes and not updates and not moves and not other_adds and not other_removes:
         st.warning("没有需要处理的人员")
         return
     try:
         with st.spinner("正在生成 Excel…"):
             data, summary = build_workbook(
-                bonus_bytes, bonus, adds, removes, list(updates), list(moves), mode=mode
+                bonus_bytes,
+                bonus,
+                adds,
+                removes,
+                list(updates),
+                list(moves),
+                mode=mode,
+                other_adds=list(other_adds),
+                other_removes=list(other_removes),
             )
     except Exception as exc:  # noqa: BLE001 - 生成失败要给出可读原因
         st.error(f"生成失败：{type(exc).__name__}: {exc}")
@@ -999,6 +1071,10 @@ def render_sidebar(names, guess_roster, guess_bonus, intern_total):
             Review("").reset()
             Review("sup").reset()
             Review("all").reset()
+            Review("search").reset()
+            st.session_state["manual_placements"] = []
+            st.session_state.pop("search_hits", None)
+            st.session_state.pop("search_query", None)
             st.rerun()
     return {
         "roster_name": roster_name,
@@ -1016,6 +1092,7 @@ def render_sidebar(names, guess_roster, guess_bonus, intern_total):
 FEATURE_FRONTLINE = "① 一线人员"
 FEATURE_SUPERVISOR = "② 副主任&工艺组长及其他"
 FEATURE_COMBINED = "③ 一键生成全部"
+FEATURE_SEARCH = "④ 检索与投放"
 
 
 def main() -> None:
@@ -1068,17 +1145,200 @@ def main() -> None:
 
     feature = st.radio(
         "要处理哪张子表",
-        [FEATURE_FRONTLINE, FEATURE_SUPERVISOR, FEATURE_COMBINED],
+        [FEATURE_FRONTLINE, FEATURE_SUPERVISOR, FEATURE_COMBINED, FEATURE_SEARCH],
         horizontal=True,
         key="feature",
-        help="①② 的复核状态各自独立。③ 把两侧改动写进同一份核算表。",
+        help="①② 的复核状态各自独立。③ 把两侧改动写进同一份核算表。④ 按姓名/工号/关键字检索后手工投放。",
     )
     if feature == FEATURE_SUPERVISOR:
         render_supervisor_feature(payload, result, roster, bonus, analysis, options_)
     elif feature == FEATURE_COMBINED:
         render_combined_feature(payload, result, roster, bonus, analysis, options_)
+    elif feature == FEATURE_SEARCH:
+        render_search_feature(payload, result, bonus, options_)
     else:
         render_frontline_feature(payload, result, bonus, analysis, options_)
+
+
+def _upsert_placement(row: dict) -> None:
+    items = st.session_state.setdefault("manual_placements", [])
+    for index, existing in enumerate(items):
+        same_source = (
+            existing.get("source_file") == row.get("source_file")
+            and existing.get("source_sheet") == row.get("source_sheet")
+            and int(existing.get("source_row") or 0) == int(row.get("source_row") or 0)
+        )
+        if same_source:
+            row["placement_id"] = existing.get("placement_id") or row["placement_id"]
+            items[index] = row
+            return
+    items.append(row)
+
+
+def render_search_feature(payload, result, bonus, options_) -> None:
+    """按关键字找出整行，编辑后投放到一线人员或副主任表。"""
+    bonus_name = options_["bonus_name"]
+    st.caption(
+        "在所有已上传表格里搜姓名、工号或任意关键字，命中后会标出文件 / 子表 / 行号并展示整行原文。"
+        "你可以改姓名、工号、职务、车间、入职日期，再选投放到「一线人员」或「副主任&工艺组长及其他」。"
+        "投放清单会随 ①②③ 的导出一起写入；本页也可以只按投放清单生成一份已应用版。"
+        "从一线挪到副主任表请用本页或 ①③ 导出，只出 ② 不会改一线人员子表。"
+    )
+
+    with st.form("search_form"):
+        query = st.text_input(
+            "姓名 / 工号 / 关键字",
+            value=st.session_state.get("search_query", ""),
+            placeholder="例如：张文艺 或 ALS0702 或 委培",
+        )
+        submitted = st.form_submit_button("搜索", type="primary")
+    if submitted:
+        hits = search_tables(result.tables, query)
+        st.session_state["search_hits"] = [asdict(hit) for hit in hits]
+        st.session_state["search_query"] = query
+
+    hits = st.session_state.get("search_hits") or []
+    query_text = st.session_state.get("search_query") or ""
+    if query_text and not hits:
+        st.info(f"没有找到包含「{query_text}」的行。")
+    elif hits:
+        st.write(f"找到 **{len(hits)}** 条（最多 80 条）")
+        overview = pd.DataFrame(
+            [
+                {
+                    "姓名": hit.get("name") or "",
+                    "员工编号": hit.get("eid") or "",
+                    "文件": hit.get("file_name") or "",
+                    "子表": hit.get("sheet_name") or "",
+                    "Excel行": hit.get("excel_row") or "",
+                    "命中列": "、".join(hit.get("matched") or []),
+                }
+                for hit in hits
+            ]
+        )
+        st.dataframe(overview, hide_index=True, width="stretch")
+
+        labels = [
+            f"{hit.get('name') or '—'} | {hit.get('eid') or '—'}｜"
+            f"{hit.get('file_name')} / {hit.get('sheet_name')} 第 {hit.get('excel_row')} 行"
+            for hit in hits
+        ]
+        chosen = st.selectbox(
+            "选中一条查看整行并投放",
+            list(range(len(hits))),
+            format_func=lambda index: labels[index],
+        )
+        hit = hits[chosen]
+        st.markdown(
+            f"**位置**：`{hit.get('file_name')}` / `{hit.get('sheet_name')}` "
+            f"第 {hit.get('excel_row')} 行"
+        )
+        cells = hit.get("cells") or {}
+        if cells:
+            st.dataframe(pd.DataFrame([cells]), hide_index=True, width="stretch")
+        fields = infer_fields(cells)
+        default_duty = str(fields.get("duty") or "")
+        default_target = (
+            SHEET_OTHERS
+            if any(title in default_duty for title in MANAGEMENT_TITLES)
+            else SHEET_FRONTLINE
+        )
+        col_a, col_b, col_c = st.columns(3)
+        name = col_a.text_input("姓名", str(fields.get("name") or hit.get("name") or ""))
+        eid = col_b.text_input("员工编号", str(fields.get("eid") or hit.get("eid") or ""))
+        duty = col_c.text_input("职务", default_duty)
+        col_d, col_e, col_f = st.columns(3)
+        workshop = col_d.text_input("车间", str(fields.get("workshop") or ""))
+        hire = col_e.text_input("入职日期", fmt_date(fields.get("hire_date")) or "")
+        target = col_f.radio(
+            "投放到",
+            [SHEET_FRONTLINE, SHEET_OTHERS],
+            index=0 if default_target == SHEET_FRONTLINE else 1,
+            horizontal=True,
+        )
+        if st.button("加入投放清单", type="primary"):
+            _upsert_placement(
+                {
+                    "placement_id": str(uuid.uuid4()),
+                    "name": name,
+                    "eid": eid,
+                    "duty": duty,
+                    "workshop": workshop,
+                    "hire_date": hire,
+                    "target_sheet": target,
+                    "source_file": hit.get("file_name") or "",
+                    "source_sheet": hit.get("sheet_name") or "",
+                    "source_row": int(hit.get("excel_row") or 0),
+                }
+            )
+            st.rerun()
+
+    placements = st.session_state.setdefault("manual_placements", [])
+    st.subheader(f"投放清单（{len(placements)}）")
+    if not placements:
+        st.caption("还没有投放。搜索到人之后点「加入投放清单」。")
+    else:
+        for row in list(placements):
+            pid = row.get("placement_id") or ""
+            title = (
+                f"{row.get('name') or '—' } {row.get('eid') or ''} → "
+                f"{row.get('target_sheet') or SHEET_FRONTLINE}"
+            )
+            with st.expander(title, expanded=True):
+                st.caption(
+                    f"来源：{row.get('source_file')} / {row.get('source_sheet')} "
+                    f"第 {row.get('source_row')} 行"
+                )
+                a, b, c = st.columns(3)
+                row["name"] = a.text_input("姓名", row.get("name") or "", key=f"pl_name_{pid}")
+                row["eid"] = b.text_input("员工编号", row.get("eid") or "", key=f"pl_eid_{pid}")
+                row["duty"] = c.text_input("职务", row.get("duty") or "", key=f"pl_duty_{pid}")
+                d, e, f = st.columns(3)
+                row["workshop"] = d.text_input("车间", row.get("workshop") or "", key=f"pl_ws_{pid}")
+                row["hire_date"] = e.text_input(
+                    "入职日期", row.get("hire_date") or "", key=f"pl_hire_{pid}"
+                )
+                options = [SHEET_FRONTLINE, SHEET_OTHERS]
+                current = row.get("target_sheet") or SHEET_FRONTLINE
+                row["target_sheet"] = f.radio(
+                    "投放到",
+                    options,
+                    index=options.index(current) if current in options else 0,
+                    horizontal=True,
+                    key=f"pl_target_{pid}",
+                )
+                if st.button("从清单移除", key=f"pl_del_{pid}"):
+                    st.session_state.manual_placements = [
+                        item for item in placements if item.get("placement_id") != pid
+                    ]
+                    st.rerun()
+
+    extra_fl, extra_sup, _ = search_bundle(bonus)
+    adds, removes, updates, moves = split_by_action(extra_fl)
+    sup_adds, sup_removes = sup_split_by_action(extra_sup)
+    left, right = st.columns(2)
+    with left:
+        st.subheader("将写入一线人员")
+        preview_counts(adds, removes, updates, moves, "直接删除")
+    with right:
+        st.subheader("将写入副主任表")
+        supervisor_preview(sup_adds, sup_removes, "直接删除")
+
+    review = Review("search")
+    if st.button("按投放清单生成已应用版", type="primary", width="stretch", key="search_gen"):
+        generate_combined(
+            review,
+            result.raw_files[bonus_name],
+            bonus,
+            adds,
+            removes,
+            updates,
+            moves,
+            sup_adds,
+            sup_removes,
+        )
+    offer_download(review, "apply", bonus.file_name, "检索投放·已应用版")
+    render_database(payload, result)
 
 
 def render_frontline_feature(payload, result, bonus, analysis, options_) -> None:
@@ -1282,8 +1542,11 @@ def render_supervisor_feature(payload, result, roster, bonus, frontline_analysis
         render_database(payload, result)
 
 
-def collect_supervisor_items(review: Review, analysis, *, approved_only: bool):
+def collect_supervisor_items(
+    review: Review, analysis, *, approved_only: bool, extra=None, exclude_keys=None
+):
     """按当前复核结果收集副主任表导出清单，语义与 ``collect_frontline_items`` 对齐。"""
+    skip = exclude_keys or set()
     mapping = {
         item.group: item.target_workshop for item in analysis.items if item.action == "add"
     }
@@ -1296,15 +1559,23 @@ def collect_supervisor_items(review: Review, analysis, *, approved_only: bool):
     items = [
         resolved(item)
         for item in analysis.items
-        if (review.decisions.get(item.label) == APPLY)
-        or (not approved_only and review.decisions.get(item.label) != CANCEL)
+        if item.key not in skip
+        and (
+            (review.decisions.get(item.label) == APPLY)
+            or (not approved_only and review.decisions.get(item.label) != CANCEL)
+        )
     ]
-    return sup_split_by_action(items)
+    return sup_split_by_action(items + list(extra or []))
 
 
 def render_supervisor_export(review: Review, bonus_bytes, bonus, analysis) -> None:
-    kept = collect_supervisor_items(review, analysis, approved_only=False)
-    approved = collect_supervisor_items(review, analysis, approved_only=True)
+    _, extra_sup, exclude = search_bundle(bonus)
+    kept = collect_supervisor_items(
+        review, analysis, approved_only=False, extra=extra_sup, exclude_keys=exclude
+    )
+    approved = collect_supervisor_items(
+        review, analysis, approved_only=True, extra=extra_sup, exclude_keys=exclude
+    )
 
     left, right = st.columns(2)
     with left:
@@ -1410,11 +1681,23 @@ def render_combined_feature(payload, result, roster, bonus, frontline_analysis, 
     )
     approved_only = scope == "只处理已经勾选「应用」的人"
 
+    extra_fl, extra_sup, exclude = search_bundle(bonus)
+    if extra_fl or extra_sup:
+        st.caption(f"含检索投放 {len(current_placements())} 人，将随本次导出写入。")
     fl_adds, fl_removes, fl_updates, fl_moves = collect_frontline_items(
-        frontline_review, frontline_analysis, include_pending, approved_only=approved_only
+        frontline_review,
+        frontline_analysis,
+        include_pending,
+        approved_only=approved_only,
+        extra=extra_fl,
+        exclude_keys=exclude,
     )
     sup_adds, sup_removes = collect_supervisor_items(
-        supervisor_review, supervisor_analysis, approved_only=approved_only
+        supervisor_review,
+        supervisor_analysis,
+        approved_only=approved_only,
+        extra=extra_sup,
+        exclude_keys=exclude,
     )
     move_keys = {item.key for item in fl_moves}
     unique_sup_adds = [
