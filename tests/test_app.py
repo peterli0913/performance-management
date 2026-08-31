@@ -202,6 +202,7 @@ def test_duty_field_switch_reruns_without_error(app):
 
 
 FEATURE_SUPERVISOR = "② 副主任&工艺组长及其他"
+FEATURE_COMBINED = "③ 一键生成全部"
 
 
 def _walk(node, out=None):
@@ -361,6 +362,51 @@ def test_cancel_column_removes_person_from_both_exports():
     next(b for b in instance.button if b.label == "生成对照标记版").click().run()
     messages = [block.value for block in instance.success]
     assert any("新增 277 人" in text for text in messages), messages
+
+
+def test_combined_feature_is_on_the_radio():
+    instance = AppTest.from_file(APP, default_timeout=200).run()
+    feature = instance.radio(key="feature")
+    assert FEATURE_COMBINED in feature.options
+    feature.set_value(FEATURE_COMBINED).run()
+    assert not instance.exception, [e.value for e in instance.exception]
+    assert _stray_elements(instance) == []
+    labels = [button.label for button in instance.button]
+    assert "生成全部已应用版" in labels
+    markdown = " ".join(block.value for block in instance.markdown)
+    assert "将新增 **279** 人" in markdown
+    assert "移到副主任表 **15** 人" in markdown
+    captions = " ".join(block.value for block in instance.caption)
+    assert "另有 15 人从一线移入" in captions
+    info = " ".join(block.value for block in instance.info)
+    assert "有 6 人同时出现在一线移出和副主任表待新增里" in info
+
+
+def test_combined_approved_only_uses_existing_decisions():
+    """没勾应用时，第二种范围只留下待定类的自动动作。"""
+    instance = AppTest.from_file(APP, default_timeout=200).run()
+    instance.radio(key="feature").set_value(FEATURE_COMBINED).run()
+    instance.radio(key="combined_scope").set_value("只处理已经勾选「应用」的人").run()
+    assert not instance.exception, [e.value for e in instance.exception]
+    markdown = " ".join(block.value for block in instance.markdown)
+    assert "将新增 **0** 人" in markdown
+    assert "移到副主任表 **15** 人" in markdown
+    assert "按清单更新 **1** 人" in markdown
+
+
+def test_combined_generate_offers_one_download():
+    instance = AppTest.from_file(APP, default_timeout=300).run()
+    instance.radio(key="feature").set_value(FEATURE_COMBINED).run()
+    next(b for b in instance.button if b.label == "生成全部已应用版").click().run()
+    assert not instance.exception, [e.value for e in instance.exception]
+    success = " ".join(block.value for block in instance.success)
+    assert "直接插入 279 人" in success
+    assert "直接删除 41 人" in success
+    assert "移到「副主任&工艺组长及其他」15 人" in success
+    assert "副主任表直接插入 15 人" in success
+    assert "副主任表直接删除 11 人" in success
+    labels = [d.label for d in instance.get("download_button")]
+    assert any("两表已应用版" in label for label in labels)
 
 
 def test_preview_counts_match_generated_counts():

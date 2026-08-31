@@ -12,7 +12,7 @@ import os
 import pandas as pd
 import streamlit as st
 
-from tj4tools.bonus_export import build_workbook, split_by_action
+from tj4tools.bonus_export import build_combined_workbook, build_workbook, split_by_action
 from tj4tools.db import Workspace
 from tj4tools.ingest import ingest_files
 from tj4tools.normalize import date_from_filename, fmt_date, months_before
@@ -688,8 +688,13 @@ def output_name(bonus_name: str, suffix: str) -> str:
     return f"{base}（{suffix}{stamp}）.xlsx"
 
 
-def render_export(review: Review, bonus_bytes, bonus, analysis, include_pending) -> None:
-    decisions = review.decisions
+def collect_frontline_items(review: Review, analysis, include_pending, *, approved_only: bool):
+    """按当前复核结果收集一线人员导出清单。
+
+    ``approved_only=True`` 只要勾了「应用」的人（已应用版）；
+    ``False`` 则排除勾了「取消」的人（对照标记版 / 一键全部应用）。
+    「待定·核算有清单无」始终按动作列执行，不看应用/取消。
+    """
 
     def resolved(item):
         item.workshop = to_workshop(effective_workshop(review, item, analysis.mapping))
@@ -701,7 +706,6 @@ def render_export(review: Review, bonus_bytes, bonus, analysis, include_pending)
         if item.category in (CATEGORY_NEW, CATEGORY_LEFT)
         or include_pending.get(item.category, True)
     ]
-    # 「待定·核算有清单无」不走应用/取消，而是按各自的"动作"列执行
     auto = []
     for item in selectable:
         if item.category != CATEGORY_PENDING_DEL:
@@ -710,8 +714,18 @@ def render_export(review: Review, bonus_bytes, bonus, analysis, include_pending)
         item.action = "move" if action == ACTION_TO_OTHERS else "update"
         auto.append(resolved(item))
     reviewed = [i for i in selectable if i.category != CATEGORY_PENDING_DEL]
-    kept = auto + [resolved(i) for i in reviewed if decisions.get(i.label) != CANCEL]
-    approved = auto + [resolved(i) for i in reviewed if decisions.get(i.label) == APPLY]
+    chosen = [
+        resolved(item)
+        for item in reviewed
+        if (review.decisions.get(item.label) == APPLY)
+        or (not approved_only and review.decisions.get(item.label) != CANCEL)
+    ]
+    return split_by_action(auto + chosen)
+
+
+def render_export(review: Review, bonus_bytes, bonus, analysis, include_pending) -> None:
+    kept = collect_frontline_items(review, analysis, include_pending, approved_only=False)
+    approved = collect_frontline_items(review, analysis, include_pending, approved_only=True)
 
     left, right = st.columns(2)
     with left:
@@ -721,7 +735,7 @@ def render_export(review: Review, bonus_bytes, bonus, analysis, include_pending)
             "姓名与员工编号填**绿色**；需删除的人员保留原行、填**红色**；"
             "按清单更新的人员就地改值、改动的单元格填**橙色**。被点「取消」的人不纳入。"
         )
-        adds, removes, updates, moves = split_by_action(kept)
+        adds, removes, updates, moves = kept
         preview_counts(adds, removes, updates, moves, "标记删除")
         if st.button("生成对照标记版", type="primary", width="stretch",
                      key=review.widget("gen_mark")):
@@ -734,7 +748,7 @@ def render_export(review: Review, bonus_bytes, bonus, analysis, include_pending)
             "只处理被点「应用」的人员：删除类**直接删行**、新增类**直接插入对应位置**"
             "且内容用**红色字体**、更新类就地改成清单里的值。"
         )
-        adds, removes, updates, moves = split_by_action(approved)
+        adds, removes, updates, moves = approved
         preview_counts(adds, removes, updates, moves, "直接删除")
         if st.button("生成已应用版", type="primary", width="stretch",
                      key=review.widget("gen_apply")):
@@ -945,8 +959,9 @@ def render_sidebar(names, guess_roster, guess_bonus, intern_total):
         }
         st.divider()
         if st.button("重置全部人工决策"):
-            for key in ("decisions", "workshop_override", "mapping_override"):
-                st.session_state[key] = {}
+            Review("").reset()
+            Review("sup").reset()
+            Review("all").reset()
             st.rerun()
     return {
         "roster_name": roster_name,
@@ -963,6 +978,7 @@ def render_sidebar(names, guess_roster, guess_bonus, intern_total):
 
 FEATURE_FRONTLINE = "① 一线人员"
 FEATURE_SUPERVISOR = "② 副主任&工艺组长及其他"
+FEATURE_COMBINED = "③ 一键生成全部"
 
 
 def main() -> None:
@@ -1014,14 +1030,16 @@ def main() -> None:
         return
 
     feature = st.radio(
-        "要生成哪张子表",
-        [FEATURE_FRONTLINE, FEATURE_SUPERVISOR],
+        "要处理哪张子表",
+        [FEATURE_FRONTLINE, FEATURE_SUPERVISOR, FEATURE_COMBINED],
         horizontal=True,
         key="feature",
-        help="两张子表的取人口径不同，复核状态各自独立。",
+        help="①② 的复核状态各自独立。③ 把两侧改动写进同一份核算表。",
     )
     if feature == FEATURE_SUPERVISOR:
         render_supervisor_feature(payload, result, roster, bonus, analysis, options_)
+    elif feature == FEATURE_COMBINED:
+        render_combined_feature(payload, result, roster, bonus, analysis, options_)
     else:
         render_frontline_feature(payload, result, bonus, analysis, options_)
 
@@ -1222,8 +1240,8 @@ def render_supervisor_feature(payload, result, roster, bonus, frontline_analysis
         render_database(payload, result)
 
 
-def render_supervisor_export(review: Review, bonus_bytes, bonus, analysis) -> None:
-    decisions = review.decisions
+def collect_supervisor_items(review: Review, analysis, *, approved_only: bool):
+    """按当前复核结果收集副主任表导出清单，语义与 ``collect_frontline_items`` 对齐。"""
     mapping = {
         item.group: item.target_workshop for item in analysis.items if item.action == "add"
     }
@@ -1233,8 +1251,18 @@ def render_supervisor_export(review: Review, bonus_bytes, bonus, analysis) -> No
             item.target_workshop = to_workshop(effective_workshop(review, item, mapping))
         return item
 
-    kept = [resolved(i) for i in analysis.items if decisions.get(i.label) != CANCEL]
-    approved = [resolved(i) for i in analysis.items if decisions.get(i.label) == APPLY]
+    items = [
+        resolved(item)
+        for item in analysis.items
+        if (review.decisions.get(item.label) == APPLY)
+        or (not approved_only and review.decisions.get(item.label) != CANCEL)
+    ]
+    return sup_split_by_action(items)
+
+
+def render_supervisor_export(review: Review, bonus_bytes, bonus, analysis) -> None:
+    kept = collect_supervisor_items(review, analysis, approved_only=False)
+    approved = collect_supervisor_items(review, analysis, approved_only=True)
 
     left, right = st.columns(2)
     with left:
@@ -1243,7 +1271,7 @@ def render_supervisor_export(review: Review, bonus_bytes, bonus, analysis) -> No
             "新增人员插到本表对应车间**该职务**的最下方、姓名与员工编号填**绿色**；"
             "需删除的人员保留原行、填**红色**。被点「取消」的人不纳入。"
         )
-        adds, removes = sup_split(kept)
+        adds, removes = kept
         supervisor_preview(adds, removes, "标记删除")
         if st.button("生成对照标记版", type="primary", width="stretch",
                      key=review.widget("gen_mark")):
@@ -1253,7 +1281,7 @@ def render_supervisor_export(review: Review, bonus_bytes, bonus, analysis) -> No
     with right:
         st.subheader("② 已应用版")
         st.caption("只处理被点「应用」的人：删除类**直接删行**、新增类**直接插入**且内容用**红色字体**。")
-        adds, removes = sup_split(approved)
+        adds, removes = approved
         supervisor_preview(adds, removes, "直接删除")
         if st.button("生成已应用版", type="primary", width="stretch",
                      key=review.widget("gen_apply")):
@@ -1290,6 +1318,135 @@ def supervisor_generate(review: Review, mode, bonus_bytes, bonus, adds, removes)
         return
     st.session_state[review.key(f"blob_{mode}")] = data
     st.session_state[review.key(f"summary_{mode}")] = summary
+
+
+def render_combined_feature(payload, result, roster, bonus, frontline_analysis, options_) -> None:
+    """把两个功能里的已应用改动写进同一份核算表。"""
+    frontline_review = Review("")
+    supervisor_review = Review("sup")
+    bundle = Review("all")
+    bonus_name = options_["bonus_name"]
+    include_pending = options_["include_pending"]
+
+    st.caption(
+        "一次生成一份核算表，同时改「一线人员」和「副主任&工艺组长及其他」。"
+        "默认把两侧**还没点取消**的人都按「应用」处理（直接删行 / 插入，新增红字，实习生黄底）；"
+        "已经在 ①② 里点过「取消」的人仍然排除。"
+        "同一个人既要从一线移出、又是副主任表待新增时，副主任表只插一行。"
+    )
+    if bonus.others_layout is None:
+        st.error("核算文件里找不到「副主任&工艺组长及其他」子表，无法一键生成两表。")
+        return
+
+    placeable = frozenset(
+        item.key
+        for item in frontline_analysis.items
+        if item.action == "add"
+        and to_workshop(effective_workshop(frontline_review, item, frontline_analysis.mapping))
+    )
+    try:
+        supervisor_analysis = cached_supervisor_analyze(
+            options_["roster_name"],
+            result.raw_files[options_["roster_name"]],
+            bonus_name,
+            result.raw_files[bonus_name],
+            options_["duty_field"],
+            options_["include_interns"],
+            options_["ref_date"],
+            options_["new_hire_since"],
+            options_["intern_asof"],
+            SCOPE_STRICT,
+            placeable,
+        )
+    except Exception as exc:  # noqa: BLE001 - 解析失败要给出可读原因
+        st.error(f"对账失败：{type(exc).__name__}: {exc}")
+        return
+
+    scope = st.radio(
+        "纳入范围",
+        ["两侧未取消的全部按应用处理", "只处理已经勾选「应用」的人"],
+        horizontal=True,
+        key="combined_scope",
+        help="第一种就是「一键」：不用先去 ①② 逐条勾选。第二种沿用你在 ①② 里勾过的应用。",
+    )
+    approved_only = scope == "只处理已经勾选「应用」的人"
+
+    fl_adds, fl_removes, fl_updates, fl_moves = collect_frontline_items(
+        frontline_review, frontline_analysis, include_pending, approved_only=approved_only
+    )
+    sup_adds, sup_removes = collect_supervisor_items(
+        supervisor_review, supervisor_analysis, approved_only=approved_only
+    )
+    move_keys = {item.key for item in fl_moves}
+    unique_sup_adds = [item for item in sup_adds if item.key not in move_keys]
+
+    left, right = st.columns(2)
+    with left:
+        st.subheader("一线人员")
+        preview_counts(fl_adds, fl_removes, fl_updates, fl_moves, "直接删除")
+    with right:
+        st.subheader("副主任&工艺组长及其他")
+        supervisor_preview(unique_sup_adds, sup_removes, "直接删除")
+        if fl_moves:
+            st.caption(
+                f"另有 {len(fl_moves)} 人从一线移入，与上表「移到副主任表」是同一批，不会重复插行。"
+            )
+
+    overlap = sum(1 for item in sup_adds if item.key in move_keys)
+    if overlap:
+        st.info(f"有 {overlap} 人同时出现在一线移出和副主任表待新增里，导出时合并为副主任表的一行。")
+
+    if st.button("生成全部已应用版", type="primary", width="stretch", key="combined_gen"):
+        generate_combined(
+            bundle,
+            result.raw_files[bonus_name],
+            bonus,
+            fl_adds,
+            fl_removes,
+            fl_updates,
+            fl_moves,
+            sup_adds,
+            sup_removes,
+        )
+    offer_download(bundle, "apply", bonus.file_name, "两表已应用版")
+    st.info(
+        "只改「一线人员」和「副主任&工艺组长及其他」两张子表的人员行，"
+        "其余子表、字体、行高列宽、公式、筛选和条件格式全部保留；打开后 Excel 会自动重算。"
+    )
+
+
+def generate_combined(
+    review: Review,
+    bonus_bytes,
+    bonus,
+    fl_adds,
+    fl_removes,
+    fl_updates,
+    fl_moves,
+    sup_adds,
+    sup_removes,
+) -> None:
+    if not any((fl_adds, fl_removes, fl_updates, fl_moves, sup_adds, sup_removes)):
+        st.warning("没有需要处理的人员")
+        return
+    try:
+        with st.spinner("正在生成 Excel…"):
+            data, summary = build_combined_workbook(
+                bonus_bytes,
+                bonus,
+                fl_adds,
+                fl_removes,
+                fl_updates,
+                fl_moves,
+                sup_adds,
+                sup_removes,
+                mode="apply",
+            )
+    except Exception as exc:  # noqa: BLE001 - 生成失败要给出可读原因
+        st.error(f"生成失败：{type(exc).__name__}: {exc}")
+        return
+    st.session_state[review.key("blob_apply")] = data
+    st.session_state[review.key("summary_apply")] = summary
 
 
 def render_unmapped_warning(review: Review, adds, mapping) -> None:

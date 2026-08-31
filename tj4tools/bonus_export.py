@@ -67,6 +67,8 @@ class ExportSummary:
     warnings: list[str] = field(default_factory=list)
     per_workshop: dict[str, int] = field(default_factory=dict)
     fallback_duties: list[str] = field(default_factory=list)
+    other_added: int = 0
+    other_removed: int = 0
 
     def text(self) -> str:
         if self.mode == "apply":
@@ -77,6 +79,13 @@ class ExportSummary:
             parts.append(f"移到「副主任&工艺组长及其他」{self.moved} 人")
         if self.updated:
             parts.append(f"按清单更新 {self.updated} 人" + ("（标橙）" if self.mode == "mark" else ""))
+        if self.other_added or self.other_removed:
+            if self.mode == "apply":
+                parts.append(f"副主任表直接插入 {self.other_added} 人（红字）")
+                parts.append(f"副主任表直接删除 {self.other_removed} 人")
+            else:
+                parts.append(f"副主任表新增 {self.other_added} 人（标绿）")
+                parts.append(f"副主任表标记删除 {self.other_removed} 人（标红）")
         if self.interns:
             parts.append(f"其中实习生 {self.interns} 人（黄底）")
         if self.new_blocks:
@@ -97,8 +106,14 @@ def build_workbook(
     mode: str = "mark",
     workshop_for=None,
     sheet_name: str = "一线人员",
+    other_adds: list[DiffItem] | None = None,
+    other_removes: list[DiffItem] | None = None,
 ) -> tuple[bytes, ExportSummary]:
-    """返回 (xlsx 字节, 摘要)。``workshop_for(item)`` 决定每个新增人员落到哪个车间。"""
+    """返回 (xlsx 字节, 摘要)。``workshop_for(item)`` 决定每个新增人员落到哪个车间。
+
+    ``other_adds`` / ``other_removes`` 是功能二要对「副主任&工艺组长及其他」做的增删，
+    必须和一线移出的人在同一次行手术里处理，否则先插行会把副主任表的原始行号打乱。
+    """
     if mode not in ("mark", "apply"):
         raise ValueError("mode 只能是 mark 或 apply")
 
@@ -234,10 +249,63 @@ def build_workbook(
         highlights=highlights,
         first_data_row=bonus.first_data_row,
     )
-    if moves:
-        _insert_into_others(editor, bonus, moves, mode, summary)
+    if moves or other_adds or other_removes:
+        _insert_into_others(
+            editor,
+            bonus,
+            list(moves or ()),
+            mode,
+            summary,
+            extra_adds=list(other_adds or ()),
+            extra_removes=list(other_removes or ()),
+        )
     summary.warnings.extend(editor.warnings)
     return editor.to_bytes(), summary
+
+
+def build_combined_workbook(
+    data: bytes,
+    bonus: BonusFile,
+    frontline_adds: list[DiffItem],
+    frontline_removes: list[DiffItem],
+    frontline_updates: list[DiffItem] | None = None,
+    frontline_moves: list[DiffItem] | None = None,
+    supervisor_adds: list[DiffItem] | None = None,
+    supervisor_removes: list[DiffItem] | None = None,
+    *,
+    mode: str = "apply",
+) -> tuple[bytes, ExportSummary]:
+    """一键导出：同一份核算表同时改一线人员和副主任表（默认已应用版）。"""
+    return build_workbook(
+        data,
+        bonus,
+        frontline_adds,
+        frontline_removes,
+        frontline_updates,
+        frontline_moves,
+        mode=mode,
+        other_adds=supervisor_adds,
+        other_removes=supervisor_removes,
+    )
+
+
+def merge_others_inserts(moves: list[DiffItem], extra_adds: list[DiffItem]) -> list[DiffItem]:
+    """一线移出和副主任表待新增会撞上同一个人（示例文件 6 人）。
+
+    只插一行：职务用副主任表的写法（「车间副主任」→「副主任」），
+    车间空的副主任新增沿用移出时的目标车间，避免去重之后人被丢掉。
+    """
+    extras = {item.key: item for item in extra_adds}
+    inserts: list[DiffItem] = []
+    seen: set[tuple[str, str]] = set()
+    for move in moves:
+        extra = extras.get(move.key)
+        inserts.append(extra if extra is not None else move)
+        seen.add(move.key)
+    for extra in extra_adds:
+        if extra.key not in seen:
+            inserts.append(extra)
+    return inserts
 
 
 def insert_into_layout(
@@ -313,13 +381,64 @@ def insert_into_layout(
 
 
 def _insert_into_others(
-    editor: XlsxEditor, bonus: BonusFile, moves: list[DiffItem], mode: str, summary: ExportSummary
+    editor: XlsxEditor,
+    bonus: BonusFile,
+    moves: list[DiffItem],
+    mode: str,
+    summary: ExportSummary,
+    extra_adds: list[DiffItem] | None = None,
+    extra_removes: list[DiffItem] | None = None,
 ) -> None:
     layout = bonus.others_layout
+    extra_adds = extra_adds or []
+    extra_removes = extra_removes or []
     if layout is None:
-        summary.warnings.append("核算文件里没有「副主任&工艺组长及其他」子表，移动动作已跳过")
+        summary.warnings.append(
+            "核算文件里没有「副主任&工艺组长及其他」子表，移动/副主任表动作已跳过"
+        )
         return
-    insert_into_layout(editor, layout, moves, mode, summary)
+
+    columns = layout.columns
+    deletes: set[int] = set()
+    highlights: list[Highlight] = []
+    for item in extra_removes:
+        if not item.frontline_row:
+            summary.skipped.append(f"{item.name}（{item.eid}）没有原始行号，已跳过")
+            continue
+        if mode == "apply":
+            deletes.add(item.frontline_row)
+        else:
+            highlights.append(
+                Highlight(
+                    row=item.frontline_row,
+                    cols=[columns["name"], columns["eid"]],
+                    color=FILL_RED,
+                )
+            )
+        summary.other_removed += 1
+
+    inserts = merge_others_inserts(moves, extra_adds)
+    move_keys = {item.key for item in moves}
+    move_workshop = {item.key: item.target_workshop or item.workshop for item in moves}
+    summary.other_added = sum(
+        1
+        for item in extra_adds
+        if item.key not in move_keys and (item.target_workshop or item.workshop)
+    )
+
+    def workshop_of(item: DiffItem) -> str:
+        return item.target_workshop or item.workshop or move_workshop.get(item.key, "")
+
+    insert_into_layout(
+        editor,
+        layout,
+        inserts,
+        mode,
+        summary,
+        workshop_of=workshop_of,
+        deletes=deletes,
+        highlights=highlights,
+    )
 
 
 def _new_row(
