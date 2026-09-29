@@ -308,5 +308,8 @@ python -m pytest tests/ -q
 1. 推送本仓库到 GitHub。
 2. 新建 App，主文件填 `app.py`，依赖用 `requirements.txt`。
 3. 上传上限已在 `.streamlit/config.toml` 调到 500MB。
+4. 标题下方显示「版本 vX.Y.Z · 提交 xxxxxxx」：版本号在 `tj4tools/__init__.py` 的 `__version__`，
+   提交号读自部署目录的 `.git`。重新部署后对一下提交号和 GitHub 分支最新提交是否一致，
+   不一致就在 Streamlit 后台 Reboot app。
 
 容器文件系统是易失的，所有中间结果都在内存 `BytesIO` / 内存 SQLite 里，不会往仓库写文件。

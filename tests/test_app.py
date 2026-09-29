@@ -35,6 +35,15 @@ def test_app_boots_and_analyzes_sample_files(app):
     assert "入职时间在 2026-06-30 ~ 2026-07-31 之间的算新入职" in text
 
 
+def test_version_is_shown_under_the_title(app):
+    from tj4tools import __version__
+
+    label = app.main.caption[0].value
+    assert label.startswith(f"版本 v{__version__}")
+    # 仓库带 .git 时同时显示提交号，方便核对线上是否已部署到最新
+    assert "· 提交 " in label
+
+
 def test_new_hire_window_is_a_date_input(app):
     labels = [widget.label for widget in app.sidebar.date_input]
     assert "新入职判定窗口日期" in labels

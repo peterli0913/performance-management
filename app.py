@@ -14,6 +14,7 @@ from dataclasses import asdict
 import pandas as pd
 import streamlit as st
 
+from tj4tools import __version__
 from tj4tools.bonus_export import (
     build_combined_workbook,
     build_workbook,
@@ -1215,8 +1216,38 @@ FEATURE_COMBINED = "③ 一键生成全部"
 FEATURE_SEARCH = "④ 检索与投放"
 
 
+@st.cache_resource(show_spinner=False)
+def git_commit() -> str:
+    """部署目录里的提交号（前 7 位），用来核对线上是不是最新代码；读不到就返回空串。"""
+    git_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".git")
+    try:
+        with open(os.path.join(git_dir, "HEAD"), encoding="utf-8") as fh:
+            head = fh.read().strip()
+        if not head.startswith("ref:"):
+            return head[:7]
+        ref = head.split(":", 1)[1].strip()
+        ref_file = os.path.join(git_dir, *ref.split("/"))
+        if os.path.exists(ref_file):
+            with open(ref_file, encoding="utf-8") as fh:
+                return fh.read().strip()[:7]
+        with open(os.path.join(git_dir, "packed-refs"), encoding="utf-8") as fh:
+            for line in fh:
+                sha, _, name = line.strip().partition(" ")
+                if name == ref:
+                    return sha[:7]
+    except OSError:
+        pass
+    return ""
+
+
+def version_label() -> str:
+    commit = git_commit()
+    return f"版本 v{__version__}" + (f" · 提交 {commit}" if commit else "")
+
+
 def main() -> None:
     st.title("📊 TJ4 安全质量奖核算表生成")
+    st.caption(version_label())
 
     payload = collect_uploads()
     if not payload:
