@@ -459,6 +459,23 @@ def test_search_by_name_shows_file_and_full_row():
     assert any("投放清单（1）" in block.value for block in instance.subheader)
 
 
+def test_september_files_group_by_duty_location():
+    """09 月清单按「实际履职属地」分组；A 列本来就对齐时不挪人，导出能正常生成。"""
+    instance = AppTest.from_file(APP, default_timeout=300).run()
+    roster_box, bonus_box = instance.sidebar.selectbox[0], instance.sidebar.selectbox[1]
+    roster_box.set_value(next(o for o in roster_box.options if "09-23-2026" in o))
+    bonus_box.set_value(next(o for o in bonus_box.options if "09月" in o)).run()
+    assert not instance.exception, [e.value for e in instance.exception]
+    assert _stray_elements(instance) == []
+    captions = " ".join(block.value for block in instance.caption)
+    assert "分组取自人员清单「实际履职属地」列" in captions
+    assert "核算表车间都与清单「实际履职属地」一致" in captions
+    next(b for b in instance.button if b.label == "生成已应用版").click().run()
+    assert not instance.exception, [e.value for e in instance.exception]
+    success = " ".join(block.value for block in instance.success)
+    assert "直接插入" in success and "调整车间" not in success
+
+
 def test_mapping_dropdown_offers_route_to_others():
     import app as app_mod
     from tj4tools.roster import ROUTE_TO_OTHERS

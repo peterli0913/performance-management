@@ -31,11 +31,13 @@ from tj4tools.roster import (
     CATEGORY_NEW,
     CATEGORY_PENDING_ADD,
     CATEGORY_PENDING_DEL,
+    DUTY_LOCATION,
     ROUTE_TO_OTHERS,
     SHEET_FRONTLINE,
     SHEET_OTHERS,
     build_others_workshop_map,
     build_workshop_mapping,
+    find_relocations,
     parse_bonus,
     parse_roster,
     placeable_keys,
@@ -389,7 +391,14 @@ def describe_guess(guess) -> str:
     return f"{guess.workshop}（按命名规则推断 · 置信度{guess.confidence}）"
 
 
-def render_mapping_editor(review: Review, mapping, items, options, hint: str) -> None:
+def group_label(roster) -> str:
+    """映射表里「分组」列的标题：跟着清单实际用的列走（09 月起是「实际履职属地」）。"""
+    return (roster.group_field if roster is not None else "") or "目前分组"
+
+
+def render_mapping_editor(
+    review: Review, mapping, items, options, hint: str, label: str = "目前分组"
+) -> None:
     counts: dict[str, int] = {}
     for item in items:
         counts[item.group] = counts.get(item.group, 0) + 1
@@ -401,7 +410,7 @@ def render_mapping_editor(review: Review, mapping, items, options, hint: str) ->
         guess = mapping.get(group)
         rows.append(
             {
-                "目前分组": group,
+                label: group,
                 "待新增": count,
                 "自动建议": describe_guess(guess),
                 "最终车间": to_option(effective_group_workshop(review, group, mapping), options),
@@ -419,16 +428,16 @@ def render_mapping_editor(review: Review, mapping, items, options, hint: str) ->
             width="stretch",
             key=review.widget("mapping_editor"),
             column_config={
-                "目前分组": st.column_config.TextColumn(width="medium"),
+                label: st.column_config.TextColumn(width="medium"),
                 "待新增": st.column_config.NumberColumn(width="small"),
                 "自动建议": st.column_config.TextColumn(width="large"),
                 "最终车间": st.column_config.SelectboxColumn(
                     options=options, required=True, width="medium"
                 ),
             },
-            disabled=["目前分组", "待新增", "自动建议"],
+            disabled=[label, "待新增", "自动建议"],
         )
-        for group, before, after in zip(frame["目前分组"], frame["最终车间"], edited["最终车间"]):
+        for group, before, after in zip(frame[label], frame["最终车间"], edited["最终车间"]):
             if after != before:
                 overrides[group] = to_workshop(after)
 
@@ -841,8 +850,44 @@ def collect_routed_add_items(
     return out
 
 
+def render_relocations(review: Review, roster, bonus, analysis, exclude) -> list:
+    """已在一线、但实际履职属地对应的车间块和 A 列不一致的人；返回本次要挪的清单。"""
+    if roster is None:
+        return []
+    moves = find_relocations(roster, bonus, analysis.mapping, exclude_keys=exclude)
+    if not moves:
+        if roster.group_field == DUTY_LOCATION:
+            st.caption(f"已在一线的人，核算表车间都与清单「{DUTY_LOCATION}」一致。")
+        return []
+    enabled = st.checkbox(
+        f"按清单「{DUTY_LOCATION}」调整 {len(moves)} 人的车间（删原行，插到对应车间该职务段末尾）",
+        value=True,
+        key=review.widget("relocate"),
+    )
+    with st.expander(f"查看这 {len(moves)} 人"):
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "姓名": item.name,
+                        "员工编号": item.eid,
+                        "职务": item.duty,
+                        "核算表原行": item.frontline_row,
+                        "调到车间": item.workshop,
+                        "依据": item.reason,
+                    }
+                    for item in moves
+                ]
+            ),
+            hide_index=True,
+            width="stretch",
+        )
+    return moves if enabled else []
+
+
 def render_export(review: Review, bonus_bytes, bonus, analysis, include_pending, roster=None) -> None:
     extra_fl, extra_sup, exclude = search_bundle(bonus)
+    relocations = render_relocations(review, roster, bonus, analysis, exclude)
     kept = collect_frontline_items(
         review, analysis, include_pending, approved_only=False, extra=extra_fl, exclude_keys=exclude
     )
@@ -895,6 +940,7 @@ def render_export(review: Review, bonus_bytes, bonus, analysis, include_pending,
             generate(
                 review, "mark", bonus_bytes, bonus, adds, removes, updates, moves,
                 other_adds=list(other_adds) + routed_kept, other_removes=other_removes,
+                relocations=relocations,
             )
         offer_download(review, "mark", bonus.file_name, "对照标记版")
 
@@ -913,6 +959,7 @@ def render_export(review: Review, bonus_bytes, bonus, analysis, include_pending,
             generate(
                 review, "apply", bonus_bytes, bonus, adds, removes, updates, moves,
                 other_adds=list(other_adds) + routed_approved, other_removes=other_removes,
+                relocations=relocations,
             )
         offer_download(review, "apply", bonus.file_name, "已应用版")
 
@@ -948,8 +995,9 @@ def generate(
     moves=(),
     other_adds=(),
     other_removes=(),
+    relocations=(),
 ) -> None:
-    if not adds and not removes and not updates and not moves and not other_adds and not other_removes:
+    if not any((adds, removes, updates, moves, other_adds, other_removes, relocations)):
         st.warning("没有需要处理的人员")
         return
     try:
@@ -964,6 +1012,7 @@ def generate(
                 mode=mode,
                 other_adds=list(other_adds),
                 other_removes=list(other_removes),
+                relocations=list(relocations),
             )
     except Exception as exc:  # noqa: BLE001 - 生成失败要给出可读原因
         st.error(f"生成失败：{type(exc).__name__}: {exc}")
@@ -1451,17 +1500,19 @@ def render_frontline_feature(payload, result, roster, bonus, analysis, options_)
 
     adds = [item for item in analysis.items if item.action == "add"]
     options = build_options(bonus.workshops, {item.group for item in adds})
-    render_unmapped_warning(review, adds, analysis.mapping)
+    render_unmapped_warning(review, adds, analysis.mapping, group_label(roster))
     render_mapping_editor(
         review,
         analysis.mapping,
         adds,
         options,
+        f"分组取自人员清单「{group_label(roster)}」列，和核算表 A 列（车间）同名的直接对应。"
         "「自动建议」由两表已匹配人员反推得出。置信度低、带括号或显示「需人工指定」的行请在右侧下拉里选择；"
-        "目前分组带括号的（委培、分区等）一律不自动落车间，必须手选。"
+        "带括号且不是现成车间名的（委培、分区等）一律不自动落车间，必须手选。"
         "选「＋新建车间块」会在一线人员子表最下方新建该分组。"
         "副主任表已有的分组（13号楼、生产技术转移组等）请选「→ 副主任&工艺组长及其他」，"
         "不要新建一线车间块。",
+        group_label(roster),
     )
 
     tabs = st.tabs(
@@ -1580,15 +1631,16 @@ def render_supervisor_feature(payload, result, roster, bonus, frontline_analysis
         options_["include_interns"],
     )
     options = build_options(layout.workshops, {item.group for item in adds})
-    render_unmapped_warning(review, adds, workshop_mapping)
+    render_unmapped_warning(review, adds, workshop_mapping, group_label(roster))
     render_mapping_editor(
         review,
         workshop_mapping,
         adds,
         options,
-        "把清单的「目前分组」对应到本表的车间。本表的车间叫法和一线人员不同"
-        "（如「11号楼车间D级区域」）。目前分组带括号的一律不自动落车间，必须手选；"
+        f"把清单的「{group_label(roster)}」对应到本表的车间，与本表车间同名的直接对应。"
+        "带括号且不是现成车间名的一律不自动落车间，必须手选；"
         "选「＋新建车间块」会在本表人员区最下方新建。",
+        group_label(roster),
     )
 
     tabs = st.tabs(
@@ -1759,6 +1811,7 @@ def render_combined_feature(payload, result, roster, bonus, frontline_analysis, 
     extra_fl, extra_sup, exclude = search_bundle(bonus)
     if extra_fl or extra_sup:
         st.caption(f"含检索投放 {len(current_placements())} 人，将随本次导出写入。")
+    relocations = render_relocations(bundle, roster, bonus, frontline_analysis, exclude)
     fl_adds, fl_removes, fl_updates, fl_moves = collect_frontline_items(
         frontline_review,
         frontline_analysis,
@@ -1806,6 +1859,7 @@ def render_combined_feature(payload, result, roster, bonus, frontline_analysis, 
             fl_moves,
             sup_adds,
             sup_removes,
+            relocations=relocations,
         )
     offer_download(bundle, "apply", bonus.file_name, "两表已应用版")
     st.info(
@@ -1824,8 +1878,9 @@ def generate_combined(
     fl_moves,
     sup_adds,
     sup_removes,
+    relocations=(),
 ) -> None:
-    if not any((fl_adds, fl_removes, fl_updates, fl_moves, sup_adds, sup_removes)):
+    if not any((fl_adds, fl_removes, fl_updates, fl_moves, sup_adds, sup_removes, relocations)):
         st.warning("没有需要处理的人员")
         return
     try:
@@ -1840,6 +1895,7 @@ def generate_combined(
                 sup_adds,
                 sup_removes,
                 mode="apply",
+                relocations=list(relocations),
             )
     except Exception as exc:  # noqa: BLE001 - 生成失败要给出可读原因
         st.error(f"生成失败：{type(exc).__name__}: {exc}")
@@ -1848,7 +1904,7 @@ def generate_combined(
     st.session_state[review.key("summary_apply")] = summary
 
 
-def render_unmapped_warning(review: Review, adds, mapping) -> None:
+def render_unmapped_warning(review: Review, adds, mapping, label: str = "目前分组") -> None:
     """按当前生效的映射（含人工覆盖）实时统计，手工指定后这里的数字会立刻下降。"""
     pending: dict[str, int] = {}
     for item in adds:
@@ -1864,7 +1920,7 @@ def render_unmapped_warning(review: Review, adds, mapping) -> None:
         st.dataframe(
             pd.DataFrame(
                 sorted(pending.items(), key=lambda kv: (-kv[1], kv[0])),
-                columns=["目前分组", "待新增人数"],
+                columns=[label, "待新增人数"],
             ),
             hide_index=True,
             width="stretch",

@@ -167,6 +167,31 @@ def test_new_rows_write_workshop_name_when_column_is_not_merged(
     assert summary.new_blocks == ["测试新车间"]
 
 
+def test_september_full_export_keeps_every_row_labelled_and_blocks_contiguous(
+    sep_roster, sep_bonus, sep_bonus_bytes
+):
+    from tj4tools.bonus_export import build_workbook
+    from tj4tools.normalize import clean_text
+
+    mapping = build_workshop_mapping(sep_roster, sep_bonus)
+    result = reconcile(sep_roster, sep_bonus, mapping=mapping)
+    adds = [i for i in result.items if i.action == "add" and i.workshop]
+    removes = [i for i in result.items if i.action == "remove"]
+    data, summary = build_workbook(sep_bonus_bytes, sep_bonus, adds, removes, [], [], mode="apply")
+    assert summary.added == len(adds) and not summary.new_blocks
+    sheet = openpyxl.load_workbook(io.BytesIO(data))[FRONTLINE]
+    sequence = []
+    for row in range(sep_bonus.first_data_row, sheet.max_row + 1):
+        if not sheet.cell(row, 3).value:
+            continue
+        label = clean_text(sheet.cell(row, 1).value)
+        assert label, row
+        sequence.append(label)
+    assert len(sequence) == len(sep_bonus.frontline) + summary.added - summary.removed
+    runs = [v for index, v in enumerate(sequence) if index == 0 or sequence[index - 1] != v]
+    assert len(runs) == len(set(runs)), runs
+
+
 def test_parenthesised_workshop_keeps_original_text(sep_roster, sep_bonus, sep_bonus_bytes):
     from tj4tools.bonus_export import build_workbook
 
