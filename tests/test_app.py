@@ -152,7 +152,9 @@ def test_action_edit_updates_the_metrics_in_the_same_run():
     """指标渲染在表格上方，改完动作必须立刻重跑一次，否则数字要等下次交互才变。"""
     instance = AppTest.from_file(APP, default_timeout=250).run()
     key = "main_pending_editor_待定需填入人员（核算有·清单无）_0"
-    keys = [name for name in instance.session_state.filtered_state if "pending_editor" in name]
+    # Streamlit 1.64 起 AppTest 的 session_state 包了一层，filtered_state 在内层
+    state = getattr(instance.session_state, "_state", instance.session_state)
+    keys = [name for name in state.filtered_state if "pending_editor" in name]
     assert keys == [key], keys
     instance.session_state[key] = {
         "edited_rows": {0: {"动作": "保留在一线人员"}},

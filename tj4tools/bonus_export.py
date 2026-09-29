@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from .roster import (
     ACTION_ADD,
     ACTION_MOVE,
+    ACTION_RELOCATE,
     ACTION_REMOVE,
     ACTION_UPDATE,
     NEW_BLOCK_SENTINEL,
@@ -48,9 +49,11 @@ def _duty_rank(order, duty: str) -> int:
 
 
 def _count(summary: "ExportSummary", workshop: str, items: list) -> None:
+    items = [item for item in items if item.action != ACTION_RELOCATE]
     summary.added += len(items)
     summary.interns += sum(1 for item in items if item.is_intern)
-    summary.per_workshop[workshop] = summary.per_workshop.get(workshop, 0) + len(items)
+    if items:
+        summary.per_workshop[workshop] = summary.per_workshop.get(workshop, 0) + len(items)
 
 
 @dataclass
@@ -69,12 +72,18 @@ class ExportSummary:
     fallback_duties: list[str] = field(default_factory=list)
     other_added: int = 0
     other_removed: int = 0
+    relocated: int = 0
 
     def text(self) -> str:
         if self.mode == "apply":
             parts = [f"直接插入 {self.added} 人（红字）", f"直接删除 {self.removed} 人"]
         else:
             parts = [f"新增 {self.added} 人（标绿）", f"标记删除 {self.removed} 人（标红）"]
+        if self.relocated:
+            parts.append(
+                f"按实际履职属地调整车间 {self.relocated} 人"
+                + ("（原行标红、新位置标绿）" if self.mode == "mark" else "")
+            )
         if self.moved:
             parts.append(f"移到「副主任&工艺组长及其他」{self.moved} 人")
         if self.updated:
@@ -108,11 +117,14 @@ def build_workbook(
     sheet_name: str = "一线人员",
     other_adds: list[DiffItem] | None = None,
     other_removes: list[DiffItem] | None = None,
+    relocations: list[DiffItem] | None = None,
 ) -> tuple[bytes, ExportSummary]:
     """返回 (xlsx 字节, 摘要)。``workshop_for(item)`` 决定每个新增人员落到哪个车间。
 
     ``other_adds`` / ``other_removes`` 是功能二要对「副主任&工艺组长及其他」做的增删，
     必须和一线移出的人在同一次行手术里处理，否则先插行会把副主任表的原始行号打乱。
+    ``relocations`` 是按实际履职属地换车间块的人：原行按删除处理，再插到目标块该职务段末尾，
+    不计入新增/删除人数。
     """
     if mode not in ("mark", "apply"):
         raise ValueError("mode 只能是 mark 或 apply")
@@ -146,6 +158,20 @@ def build_workbook(
             summary.moved += 1
         else:
             summary.removed += 1
+
+    relocations = [item for item in relocations or () if item.frontline_row and item.workshop]
+    for item in relocations:
+        if mode == "apply":
+            delete_rows.add(item.frontline_row)
+        else:
+            highlights.append(
+                Highlight(
+                    row=item.frontline_row,
+                    cols=[columns["name"], columns["eid"]],
+                    color=FILL_RED,
+                )
+            )
+    summary.relocated = len(relocations)
 
     for item in updates or ():
         if not item.frontline_row:
@@ -182,7 +208,7 @@ def build_workbook(
     # 全新车间必须整体成一个块，否则会被拆成几个互不相连的合并区
     buckets: dict[tuple[str, str], list[DiffItem]] = {}
     new_blocks: dict[str, list[DiffItem]] = {}
-    for item in adds:
+    for item in list(adds) + relocations:
         workshop = (workshop_for(item) if workshop_for else item.workshop) or ""
         if not workshop:
             summary.skipped.append(f"{item.name}（{item.eid}）未指定车间，已跳过")
@@ -208,11 +234,12 @@ def build_workbook(
             summary.fallback_duties.append(f"{workshop}·{duty}")
         _, block_start, block_end = known[workshop]
         anchor = _live_anchor(anchor, delete_rows, block_start, block_end)
+        label = None if bonus.merged_workshop else bonus.raw_workshop(workshop)
         groups.append(
             InsertGroup(
                 anchor_row=anchor,
                 template_row=_pick_template(block_start, anchor, delete_rows),
-                rows=[_new_row(item, columns, mode) for item in items],
+                rows=[_new_row(item, columns, mode, workshop=label) for item in items],
                 new_block=False,
             )
         )
@@ -221,14 +248,17 @@ def build_workbook(
     for workshop, items in new_blocks.items():
         items = sorted(items, key=lambda item: _duty_rank(DEFAULT_DUTY_ORDER, item.duty))
         anchor = bonus.last_data_row
+        block_label = "" if workshop == NEW_BLOCK_SENTINEL else workshop
+        row_label = None if bonus.merged_workshop else block_label
         groups.append(
             InsertGroup(
                 anchor_row=anchor,
                 template_row=_pick_template(bonus.first_data_row, anchor, delete_rows),
-                rows=[_new_row(item, columns, mode) for item in items],
+                rows=[_new_row(item, columns, mode, workshop=row_label) for item in items],
                 new_block=True,
                 block_col=columns.get("workshop", "A"),
-                block_label="" if workshop == NEW_BLOCK_SENTINEL else workshop,
+                block_label=block_label if bonus.merged_workshop else None,
+                merge_block=bonus.merged_workshop,
             )
         )
         summary.new_blocks.append(workshop)
@@ -276,6 +306,7 @@ def build_combined_workbook(
     supervisor_removes: list[DiffItem] | None = None,
     *,
     mode: str = "apply",
+    relocations: list[DiffItem] | None = None,
 ) -> tuple[bytes, ExportSummary]:
     """一键导出：同一份核算表同时改一线人员和副主任表（默认已应用版）。"""
     return build_workbook(
@@ -288,6 +319,7 @@ def build_combined_workbook(
         mode=mode,
         other_adds=supervisor_adds,
         other_removes=supervisor_removes,
+        relocations=relocations,
     )
 
 

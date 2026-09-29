@@ -104,6 +104,8 @@ class InsertGroup:
     new_block: bool = False
     block_col: str = "A"
     block_label: str | None = None
+    # 车间列逐行写名、不合并的表（09 月起的一线人员）新块不建合并区
+    merge_block: bool = True
 
 
 @dataclass
@@ -644,8 +646,9 @@ class XlsxEditor:
                         created[0], group.block_col, slots[0], template
                     )
                     self._set_cell_value(cell, group.block_label)
-                col = group.block_col
-                new_merges.append(f"{col}{slots[0]}:{col}{slots[-1]}")
+                if group.merge_block:
+                    col = group.block_col
+                    new_merges.append(f"{col}{slots[0]}:{col}{slots[-1]}")
 
         # 按行号排序（插入的新行是 append 上去的）
         ordered = sorted(sheet_data.findall(_q("row")), key=lambda el: int(el.get("r")))

@@ -9,6 +9,9 @@ if ROOT not in sys.path:
 
 ROSTER_FILE = "TJ4生产部&生产设备部人员清单，07-31-2026.xlsx"
 BONUS_FILE = "2026年07月份安全质量奖核算数据.xlsx"
+# 09 月起清单改成「二级部门 / 三级分组 / 实际履职属地」，核算表车间按厂房重新命名
+SEP_ROSTER_FILE = "TJ4生产部&生产设备部人员清单，09-23-2026.xlsx"
+SEP_BONUS_FILE = "2026年09月份安全质量奖核算数据-09-30-2026.xlsx"
 
 
 def _read(name):
@@ -55,3 +58,22 @@ def result(roster, bonus):
     from tj4tools.roster import reconcile
 
     return reconcile(roster, bonus)
+
+
+@pytest.fixture(scope="session")
+def sep_bonus_bytes():
+    return _read(SEP_BONUS_FILE)
+
+
+@pytest.fixture(scope="session")
+def sep_roster():
+    from tj4tools.roster import parse_roster
+
+    return parse_roster(_read(SEP_ROSTER_FILE), SEP_ROSTER_FILE, include_interns=True)
+
+
+@pytest.fixture(scope="session")
+def sep_bonus(sep_bonus_bytes):
+    from tj4tools.roster import parse_bonus
+
+    return parse_bonus(sep_bonus_bytes, SEP_BONUS_FILE)

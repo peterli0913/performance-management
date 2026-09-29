@@ -50,6 +50,9 @@ SHEET_FRONTLINE = "一线人员"
 SHEET_OTHERS = "副主任&工艺组长及其他"
 # 车间映射里「放到副主任表」的哨兵，不能当一线新建车间块的名字
 ROUTE_TO_OTHERS = "__副主任表__"
+# 清单里决定车间的列，按优先级；只有精确表头都找不到时才退到含「分组」的列
+DUTY_LOCATION = "实际履职属地"
+GROUP_COLUMNS = (DUTY_LOCATION, "目前分组", "目前二级分组", "分组")
 
 NEW_BLOCK_SENTINEL = "__新增车间__"
 
@@ -233,6 +236,7 @@ class RosterFile:
     departures: dict[tuple[str, str], Person] = field(default_factory=dict)
     changes: dict[tuple[str, str], dict] = field(default_factory=dict)
     duty_field: str = "职位"
+    group_field: str = ""
     notes: list[str] = field(default_factory=list)
 
 
@@ -254,6 +258,10 @@ class BonusFile:
     duty_order: dict[str, list[str]] = field(default_factory=dict)
     duty_rank_order: list[str] = field(default_factory=list)
     merged_workshop: bool = True
+    raw_names: dict[str, str] = field(default_factory=dict)
+
+    def raw_workshop(self, workshop: str) -> str:
+        return self.raw_names.get(workshop, workshop)
 
     def block_of(self, workshop: str) -> tuple[str, int, int] | None:
         for block in self.blocks:
@@ -299,6 +307,9 @@ def parse_roster(
         result.production_all, result.production = _parse_staff_sheet(
             production, duty_field, include_interns
         )
+        header, cols = _staff_header(production)
+        if cols["group"] is not None:
+            result.group_field = clean_text(header[cols["group"]])
 
         equipment = find_sheet(workbook, SHEET_EQUIPMENT)
         if equipment is not None:
@@ -330,7 +341,8 @@ def _staff_header(sheet):
         "hire": find_col(header, "入职时间", "入职日期"),
         "post": find_col(header, "岗位"),
         "title": find_col(header, "职位", "职务"),
-        "group": find_col(header, "目前分组", "目前二级分组", "分组"),
+        # 09 月起核算表 A 列按「实际履职属地」分组；「三级分组」是跨厂房重名的 CNC区域/D级区域，不能用
+        "group": find_col(header, *GROUP_COLUMNS),
         "remark": find_col(header, "备注"),
         "leave": find_col(header, "离职时间", "离职日期"),
     }
@@ -534,13 +546,19 @@ def _parse_frontline(sheet, result: BonusFile) -> None:
         for row in range(merge.min_row, merge.max_row + 1):
             merged[row] = value
 
+    # 07 月表车间列纵向合并；09 月起改成每行都写车间名，新增行也得逐行写
+    result.merged_workshop = any(row >= data_row for row in merged)
+
     order: list[str] = []
     spans: dict[str, list[int]] = {}
     current = ""
     for row in range(data_row, sheet.max_row + 1):
-        label = merged.get(row) or clean_text(sheet.cell(row, ws_col).value)
+        raw_label = sheet.cell(row, ws_col).value
+        label = merged.get(row) or clean_text(raw_label)
         if label:
             current = label
+            if raw_label is not None:
+                result.raw_names.setdefault(label, str(raw_label).strip())
         name = norm_name(sheet.cell(row, name_col).value)
         if not name:
             continue
@@ -737,9 +755,14 @@ def group_needs_manual(group: str) -> bool:
 
 
 def withhold_parenthetical(mapping: dict[str, WorkshopGuess]) -> dict[str, WorkshopGuess]:
-    """把带括号分组的自动车间收成建议，避免委培/分区被静默写进核算表。"""
+    """把带括号分组的自动车间收成建议，避免委培/分区被静默写进核算表。
+
+    分组名本身就是表里已有的车间块（如「HP厂房1(清洗组)」）时不扣，A 列直接对 J 列。
+    """
     for guess in mapping.values():
         if not group_needs_manual(guess.group) or not guess.workshop:
+            continue
+        if guess.workshop == guess.group:
             continue
         guess.needs_manual = True
         guess.suggested = guess.workshop
@@ -779,6 +802,9 @@ def build_workshop_mapping(roster: RosterFile, bonus: BonusFile) -> dict[str, Wo
     mapping: dict[str, WorkshopGuess] = {}
     for group, counter in pairs.items():
         workshop, support = counter.most_common(1)[0]
+        # 分组名就是一线已有车间块时 A 列直接对它，不被少数调岗的人带偏
+        if group in workshops:
+            workshop, support = group, counter.get(group, 0)
         total = sum(counter.values())
         mapping[group] = WorkshopGuess(
             group=group,
@@ -801,11 +827,20 @@ def build_workshop_mapping(roster: RosterFile, bonus: BonusFile) -> dict[str, Wo
         )
     withhold_parenthetical(mapping)
     others_names = set(bonus.others_layout.workshops) if bonus.others_layout else set()
+    others_votes = {
+        group for group, guess in build_others_workshop_map(roster, bonus).items() if guess.source == "经验"
+    }
     for guess in mapping.values():
         if group_needs_manual(guess.group) and not guess.workshop:
             guess.needs_manual = True
-        # 一线没有现成车间（或带括号还没落）、副主任表已有同名车间 → 默认放副主任表
-        if guess.group in others_names and (not guess.workshop or guess.needs_manual):
+        frontline_evidence = guess.source == "经验" or (
+            guess.workshop == guess.group and guess.group in workshops
+        )
+        # 一线既没已匹配的人、也没同名车间块，而副主任表有同名块或已匹配的人 → 默认放副主任表
+        if not frontline_evidence and (guess.group in others_names or guess.group in others_votes):
+            guess.route_others = True
+        # 带括号还没落一线车间、副主任表已有同名车间 → 同样默认放副主任表
+        elif guess.group in others_names and (not guess.workshop or guess.needs_manual):
             guess.route_others = True
     return dict(sorted(mapping.items(), key=lambda item: -item[1].headcount))
 
@@ -836,10 +871,9 @@ def _rule_workshop(group: str, workshops: set[str], mapping: dict[str, WorkshopG
     normalized = base.replace("区域", "车间") if base else ""
     if normalized in workshops:
         return normalized
-    for workshop in workshops:
-        if base and (base in workshop or workshop in base):
-            return workshop
-    return ""
+    # 只在唯一命中时采用：「多肽厂房2」同时像 CNC区域 / D级区域 / 中试 / 清洗组，不能随便挑一个
+    hits = sorted(w for w in workshops if base and (base in w or w in base))
+    return hits[0] if len(hits) == 1 else ""
 
 
 # --------------------------------------------------------------------------- #
@@ -851,6 +885,7 @@ ACTION_ADD = "add"
 ACTION_REMOVE = "remove"
 ACTION_UPDATE = "update"
 ACTION_MOVE = "move"  # 从「一线人员」移到「副主任&工艺组长及其他」
+ACTION_RELOCATE = "relocate"  # 仍在「一线人员」，按实际履职属地换到另一个车间块
 
 INTERN_SENIOR = "入职超过3个月"
 INTERN_JUNIOR = "入职不到3个月"
@@ -906,6 +941,8 @@ class DiffItem:
             return "保留在「一线人员」并按清单更新"
         if self.action == ACTION_REMOVE:
             return "从「一线人员」删除"
+        if self.action == ACTION_RELOCATE:
+            return f"在「一线人员」内调到「{self.workshop}」"
         return "新增到「一线人员」"
 
     @property
@@ -972,6 +1009,59 @@ def resolved_workshop(
     if guess.route_others:
         return ROUTE_TO_OTHERS
     return guess.workshop
+
+
+def find_relocations(
+    roster: "RosterFile",
+    bonus: "BonusFile",
+    mapping: dict,
+    *,
+    exclude_keys=None,
+) -> list[DiffItem]:
+    """两表都有的人，按清单「实际履职属地」该在的车间块和核算表 A 列不一致的，挪过去。
+
+    只在清单用「实际履职属地」分组时启用：旧清单的「目前分组」和车间不是一一对应，
+    按众数反推会把少数人误判成要挪。目标块不在一线（改走副主任表/未指定）时不动。
+    车间映射里的人工覆盖只给新增人员用，这里不看——改一个分组就会把整组在岗的人挪走。
+    """
+    if roster.group_field != DUTY_LOCATION:
+        return []
+    skip = exclude_keys or set()
+    known = set(bonus.workshops)
+    out: list[DiffItem] = []
+    for key in sorted(set(roster.production) & set(bonus.frontline), key=lambda k: bonus.frontline[k].row):
+        if key in skip:
+            continue
+        current = bonus.frontline[key]
+        source = roster.production[key]
+        target = resolved_group_workshop(source.group, mapping)
+        if not target or target == ROUTE_TO_OTHERS or target not in known:
+            continue
+        if target == current.workshop:
+            continue
+        out.append(
+            DiffItem(
+                key=key,
+                name=current.name,
+                eid=current.eid,
+                category="车间调整",
+                duty=current.duty,
+                duty_raw=current.duty_raw,
+                group=source.group,
+                workshop=target,
+                hire_date=current.hire_date,
+                reason=(
+                    f"核算表在「{current.workshop}」，清单{DUTY_LOCATION}为「{source.group}」"
+                    f"→ 应在「{target}」"
+                ),
+                frontline_row=current.row,
+                roster_row=source.row,
+                is_intern=source.is_intern,
+                intern_source=source.intern_source,
+                action=ACTION_RELOCATE,
+            )
+        )
+    return out
 
 
 @dataclass
