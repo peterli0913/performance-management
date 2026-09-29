@@ -1,0 +1,6 @@
+streamlit>=1.46,<2
+pandas>=2.2,<3
+openpyxl>=3.1,<4
+# 可选：读取 Word / PDF；缺失时 app 仍可运行，只是对应格式会在"入库问题"里报出
+python-docx>=1.1,<2
+pdfplumber>=0.11,<1
