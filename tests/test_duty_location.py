@@ -18,6 +18,7 @@ from tj4tools.roster import (
     reconcile,
     resolved_group_workshop,
 )
+from tj4tools.supervisor import reconcile_supervisors
 
 FRONTLINE = "一线人员"
 DONG = ("董浩波", "ALS12806")  # 一线「多肽厂房1D级区域」助工，第 287 行
@@ -41,6 +42,26 @@ def test_group_comes_from_duty_location_column(sep_roster):
     assert "D级区域" not in groups
     assert groups["多肽厂房2CNC区域"] == 171
     assert groups["寡核苷酸厂房1D级区域"] == 101
+
+
+def test_third_level_group_values_do_not_become_groups(sep_roster):
+    """三级分组里的「在其他厂区/部门人员」，实际履职属地写的是各自部门。"""
+    groups = {person.group for person in sep_roster.production_all.values()}
+    assert "在其他厂区/部门人员" not in groups
+    assert {"生产设备部", "TJ1生产部", "质量保证部"} <= groups
+
+
+def test_unassigned_hires_stay_out_of_frontline_but_reach_supervisor_pending(sep_roster, sep_bonus):
+    analysis = reconcile(sep_roster, sep_bonus)
+    unassigned = {
+        item.key for item in analysis.items if item.action == "add" and item.group == "质量保证部"
+    }
+    assert unassigned
+    placeable = placeable_keys(analysis)
+    assert not unassigned & placeable
+    supervisor = reconcile_supervisors(sep_roster, sep_bonus, placeable_keys=placeable)
+    pending = {item.key for item in supervisor.items if item.action == "add"}
+    assert unassigned <= pending
 
 
 def test_old_roster_still_uses_current_group(roster):

@@ -1914,7 +1914,8 @@ def render_unmapped_warning(review: Review, adds, mapping, label: str = "目前�
         return
     st.warning(
         f"还有 {sum(pending.values())} 名待新增人员的分组没有对应车间，"
-        "请在下方「车间映射」里手工指定，否则导出时会被跳过。"
+        "请在下方「车间映射」里手工指定；保持（未指定）的人不会写进「一线人员」，"
+        "会留在「副主任&工艺组长及其他」的待定名单里。"
     )
     with st.expander(f"查看这 {len(pending)} 个待指定分组"):
         st.dataframe(
